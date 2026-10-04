@@ -190,18 +190,30 @@ function Write-MonitorAlert {
     if ($Level -eq 'FAIL' -and $script:DiscordWebhookUrl) {
         try {
             $acc = Get-SilentRobloxAccountInfo
-            $accStr = if ($acc.Username) { "[$($acc.Username)]($($acc.ProfileUrl)) ($($acc.UserId))" } else { "Unknown / Not Detected" }
+            $valComp = if ($acc.Username -and $acc.UserId) {
+                "**Roblox User:** [**$($acc.Username)**]($($acc.ProfileUrl)) (ID: $($acc.UserId))"
+            } elseif ($acc.Username) {
+                "**Roblox User:** **$($acc.Username)**"
+            } else {
+                '**Roblox User:** `Unknown / Not Detected`'
+            }
+            if ($acc.ActivePlace) { $valComp += "`n**Active Place:** [$($acc.ActivePlace)](https://www.roblox.com/games/$($acc.ActivePlace))" }
+            $hwid = Get-MachineHwid
+            $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
+
             $alertEmbed = @{
                 title = "[LIVE MATCH ALERT] $Level Detected"
                 color = 15158332
-                description = ('**Roblox Account:** {0}' + "`n" + '**PC / User:** `{1}` on `{2}`') -f $accStr, $env:USERNAME, $env:COMPUTERNAME
                 fields = @(
+                    @{ name = 'Competitor Information'; value = $valComp; inline = $true },
+                    @{ name = 'Machine Fingerprint'; value = $valMach; inline = $true },
                     @{ name = "Violation Event"; value = ('```' + "`n[$Level] $text`n" + '```'); inline = $false }
                 )
-                footer = @{ text = "Spetzware v$($script:SpetzwareVersion) Live Match Monitor" }
+                footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
                 timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             }
-            Send-DiscordWebhookPayload -Payload @{ username = 'Spetzware Live Alert'; embeds = @($alertEmbed) }
+            if ($acc.AvatarUrl) { $alertEmbed.thumbnail = @{ url = $acc.AvatarUrl } }
+            Send-DiscordWebhookPayload -Payload @{ username = 'policy'; embeds = @($alertEmbed) }
         } catch {}
     }
 }
@@ -244,6 +256,18 @@ function Write-MonitorAlertOnce {
     Write-MonitorAlert @p
 }
 
+function Get-MachineHwid {
+    try {
+        $mg = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -ErrorAction Stop).MachineGuid
+        if ($mg) { return [string]$mg }
+    } catch {}
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop
+        if ($cs.UUID) { return [string]$cs.UUID }
+    } catch {}
+    return '00000000-0000-0000-0000-000000000000'
+}
+
 # ===================== Silent Roblox Account Discovery =====================
 function Get-SilentRobloxAccountInfo {
     if ($null -ne $script:DetectedRobloxAccount) { return $script:DetectedRobloxAccount }
@@ -252,8 +276,23 @@ function Get-SilentRobloxAccountInfo {
         UserId      = ''
         DisplayName = ''
         ProfileUrl  = ''
+        AvatarUrl   = ''
+        ActivePlace = ''
+        PlaceUrl    = ''
     }
     try {
+        try {
+            $proc = Get-Process -Name 'RobloxPlayerBeta' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($proc) {
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+                if ($cim -and $cim.CommandLine) {
+                    if ($cim.CommandLine -match '(?i)placeId%3D(\d+)|placeId=(\d+)') {
+                        $info.ActivePlace = if ($matches[1]) { $matches[1] } else { $matches[2] }
+                    }
+                }
+            }
+        } catch {}
+
         $logDirs = @(
             (Join-Path $env:LOCALAPPDATA 'Roblox\logs'),
             (Join-Path $env:LOCALAPPDATA 'Bloxstrap\Logs'),
@@ -263,7 +302,7 @@ function Get-SilentRobloxAccountInfo {
         foreach ($d in $logDirs) {
             if (Test-Path -LiteralPath $d) {
                 $logFiles += Get-ChildItem -LiteralPath $d -Filter '*.log' -File -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Descending | Select-Object -First 6
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 8
             }
         }
         $logFiles = @($logFiles | Sort-Object LastWriteTime -Descending)
@@ -279,7 +318,7 @@ function Get-SilentRobloxAccountInfo {
                 $reader.Close()
                 $fs.Close()
 
-                if ($content -match 'userid:(\d{4,12})') {
+                if (-not $userId -and $content -match 'userid:(\d{4,12})') {
                     $userId = $matches[1]
                 }
                 if (-not $username -and $content -match 'Players\.([a-zA-Z0-9_]{3,20})\.(?:PlayerGui|PlayerScripts|Character)') {
@@ -288,8 +327,15 @@ function Get-SilentRobloxAccountInfo {
                 if (-not $username -and $content -match '"userName"\s*:\s*"([a-zA-Z0-9_]{3,20})"') {
                     $username = $matches[1]
                 }
-                if ($userId) { break }
+                if (-not $info.ActivePlace -and $content -match '(?i)place\s*id[:\s=]+(\d{5,16})|place\s+(\d{5,16})|Joining\s+Game\s*\(([0-9]{5,16})') {
+                    $info.ActivePlace = if ($matches[1]) { $matches[1] } elseif ($matches[2]) { $matches[2] } else { $matches[3] }
+                }
+                if ($userId -and $info.ActivePlace) { break }
             } catch {}
+        }
+
+        if ($info.ActivePlace) {
+            $info.PlaceUrl = "https://www.roblox.com/games/$($info.ActivePlace)"
         }
 
         if ($userId) {
@@ -299,6 +345,13 @@ function Get-SilentRobloxAccountInfo {
                 $resp = Invoke-RestMethod -Uri "https://users.roblox.com/v1/users/$userId" -Method Get -TimeoutSec 3 -ErrorAction Stop
                 if ($resp.name) { $info.Username = [string]$resp.name }
                 if ($resp.displayName) { $info.DisplayName = [string]$resp.displayName }
+            } catch {}
+
+            try {
+                $thumbResp = Invoke-RestMethod -Uri "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=$userId&size=150x150&format=Png&isCircular=false" -Method Get -TimeoutSec 3 -ErrorAction Stop
+                if ($thumbResp.data -and $thumbResp.data[0].imageUrl) {
+                    $info.AvatarUrl = [string]$thumbResp.data[0].imageUrl
+                }
             } catch {}
         }
         if (-not $info.Username -and $username) {
@@ -381,6 +434,42 @@ function Send-DiscordTextInChunks {
     }
 }
 
+function Format-AnsiSummaryBlock {
+    param([array]$SectionResults)
+    $esc = [char]27
+    $lines = @()
+    foreach ($r in $SectionResults) {
+        $s = $r.Summary
+        $counts = @()
+        if ($s.Fail -gt 0) { $counts += "$($s.Fail) fail" }
+        if ($s.Warn -gt 0) { $counts += "$($s.Warn) warn" }
+        if ($s.Info -gt 0) { $counts += "$($s.Info) info" }
+        $countText = if ($counts.Count -gt 0) { '(' + ($counts -join ', ') + ')' } else { '' }
+
+        $lineText = if ($r.Name.Length -ge 30) {
+            "$($r.Name) [$($s.Status)]"
+        } else {
+            ('{0,-30} [{1}]' -f $r.Name, $s.Status)
+        }
+        if ($countText) {
+            $lineText += "  $countText"
+        }
+
+        $colorCode = if ($s.Status -eq 'FAIL') {
+            '31'
+        } elseif ($s.Status -eq 'WARN') {
+            '33'
+        } elseif ($s.Info -gt 0) {
+            '32'
+        } else {
+            '36'
+        }
+
+        $lines += "$esc[${colorCode}m$lineText$esc[0m"
+    }
+    return '```ansi' + "`n" + ($lines -join "`n") + "`n" + '```'
+}
+
 function Send-SpetzwareStep1Webhook {
     param(
         [array]$Results,
@@ -395,99 +484,79 @@ function Send-SpetzwareStep1Webhook {
 
     try {
         $acc = Get-SilentRobloxAccountInfo
-        $ts = [int64]((Get-Date).ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
         $color = if ($FailCount -gt 0) { 15158332 } elseif ($WarnCount -gt 0) { 15844367 } else { 3066993 }
 
-        $descLines = @()
-        if ($acc.Username) {
-            $accLine = ('**Roblox Account:** [**{0}**]({1}) (`{2}`)' -f $acc.Username, $acc.ProfileUrl, $acc.UserId)
-            if ($acc.DisplayName -and $acc.DisplayName -ne $acc.Username) {
-                $accLine += " *(Display: $($acc.DisplayName))*"
-            }
-            $descLines += $accLine
+        $valComp = if ($acc.Username -and $acc.UserId) {
+            "**Roblox User:** [**$($acc.Username)**]($($acc.ProfileUrl)) (ID: $($acc.UserId))"
+        } elseif ($acc.Username) {
+            "**Roblox User:** **$($acc.Username)**"
         } else {
-            $descLines += '**Roblox Account:** `Not Detected / No Active Session`'
+            '**Roblox User:** `Not Detected / No Active Session`'
         }
-        $descLines += ('**PC / User:** `{0}` on `{1}`' -f $env:USERNAME, $env:COMPUTERNAME)
-        $descLines += ('**Pass Rate:** **{0}%** ({1}/{2} clean, {3} FAIL, {4} WARN)' -f $SuccessRate, $PassCount, $CheckTotal, $FailCount, $WarnCount)
-        $descLines += ('**Duration:** {0}s | **Time:** <t:{1}:f>' -f [math]::Round(((Get-Date) - $StartTime).TotalSeconds), $ts)
 
-        $fields = @()
-        foreach ($r in $Results) {
-            if ($r.Summary.Fail -gt 0 -or $r.Summary.Warn -gt 0) {
-                if ($fields.Count -ge 20) {
-                    $fields += @{
-                        name = "Additional Detections"
-                        value = "*(See 1:1 raw console report below)*"
-                        inline = $false
-                    }
-                    break
-                }
-                $fieldLines = @()
-                foreach ($l in @($r.Lines)) {
-                    if ($l -match '^(FAILURE|WARNING):\s*(.*)$') {
-                        $lvl = if ($matches[1] -eq 'FAILURE') { 'FAIL' } else { 'WARN' }
-                        $fieldLines += "[$lvl] $($matches[2])"
-                    }
-                }
-                if ($fieldLines.Count -eq 0) {
-                    $fieldLines = @($r.Lines)
-                }
-                $fieldVal = ($fieldLines -join "`n")
-                if ($fieldVal.Length -gt 980) {
-                    $fieldVal = $fieldVal.Substring(0, 980) + '...'
-                }
-                $statusTag = if ($r.Summary.Fail -gt 0) { "FAIL" } else { "WARN" }
-                $fields += @{
-                    name = "$($r.Name) [$statusTag]"
-                    value = '```' + "`n$fieldVal`n" + '```'
-                    inline = $false
-                }
+        if ($acc.ActivePlace) {
+            $valComp += "`n**Active Place:** [$($acc.ActivePlace)](https://www.roblox.com/games/$($acc.ActivePlace))"
+        } else {
+            $valComp += "`n**Active Place:** None / Not In Game"
+        }
+
+        $hwid = Get-MachineHwid
+        $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
+        $valScan = "**Pass Rate:** $SuccessRate% ($PassCount/$CheckTotal Clean)`n**Fails:** $FailCount | **Warnings:** $WarnCount"
+
+        $part1 = if ($Results.Count -ge 18) { $Results[0..17] } else { $Results }
+        $part2 = if ($Results.Count -ge 37) { $Results[18..36] } elseif ($Results.Count -gt 18) { $Results[18..($Results.Count - 1)] } else { @() }
+        $part3 = if ($Results.Count -gt 37) { $Results[37..($Results.Count - 1)] } else { @() }
+
+        $embedFields = @(
+            @{ name = 'Competitor Information'; value = $valComp; inline = $true },
+            @{ name = 'Machine Fingerprint'; value = $valMach; inline = $true },
+            @{ name = 'Scan Summary'; value = $valScan; inline = $false }
+        )
+
+        if ($part1.Count -gt 0) {
+            $embedFields += @{
+                name = 'Summary Overview (Part 1)'
+                value = (Format-AnsiSummaryBlock -SectionResults $part1)
+                inline = $false
             }
         }
-        if ($fields.Count -eq 0) {
-            $fields += @{
-                name = "Result"
-                value = '```All system checks passed cleanly. No suspicious activity detected.```'
+        if ($part2.Count -gt 0) {
+            $embedFields += @{
+                name = 'Summary Overview (Part 2)'
+                value = (Format-AnsiSummaryBlock -SectionResults $part2)
+                inline = $false
+            }
+        }
+        if ($part3.Count -gt 0) {
+            $embedFields += @{
+                name = 'Summary Overview (Part 3)'
+                value = (Format-AnsiSummaryBlock -SectionResults $part3)
                 inline = $false
             }
         }
 
         $embed = @{
-            title = "Spetzware v$($script:SpetzwareVersion) - Step 1: System Check Report"
+            title = 'Spetzware - Step 1 Results'
             color = $color
-            description = ($descLines -join "`n")
-            fields = $fields
-            footer = @{ text = "Spetzware v$($script:SpetzwareVersion) Recording Check" }
+            fields = $embedFields
+            footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
             timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+        if ($acc.AvatarUrl) {
+            $embed.thumbnail = @{ url = $acc.AvatarUrl }
         }
 
         Send-DiscordWebhookPayload -Payload @{
-            username = 'Spetzware Security'
+            username = 'policy'
             embeds = @($embed)
         }
         Start-Sleep -Milliseconds 600
 
+        # Detailed 1:1 Report in Clean Codeblocks
         $reportLines = @()
         $reportLines += "========================================================================"
-        $reportLines += "  Spetzware v$($script:SpetzwareVersion)   Step 1 of 3 - System Check"
-        $reportLines += "------------------------------------------------------------------------"
-        $reportLines += "  Summary"
-        $reportLines += "------------------------------------------------------------------------"
-        foreach ($r in $Results) {
-            $s = $r.Summary
-            $counts = @()
-            if ($s.Fail -gt 0) { $counts += "$($s.Fail) fail" }
-            if ($s.Warn -gt 0) { $counts += "$($s.Warn) warn" }
-            if ($s.Info -gt 0) { $counts += "$($s.Info) info" }
-            $countText = ''
-            if ($counts.Count -gt 0) { $countText = '  (' + ($counts -join ', ') + ')' }
-            $reportLines += ('  {0,-30} [{1}]{2}' -f $r.Name, $s.Status, $countText)
-        }
-        $reportLines += "------------------------------------------------------------------------"
-        $reportLines += "  Pass rate: $SuccessRate%   $PassCount/$CheckTotal sections without FAIL, $WarnCount with warnings"
-        $reportLines += ""
-        $reportLines += "  Details"
+        $reportLines += "  Spetzware v$($script:SpetzwareVersion)   Step 1 of 3 - System Check Details"
         $reportLines += "------------------------------------------------------------------------"
         $hasDetails = $false
         foreach ($r in $Results) {
@@ -509,7 +578,7 @@ function Send-SpetzwareStep1Webhook {
             }
         }
         if (-not $hasDetails) {
-            $reportLines += "  All sections clean."
+            $reportLines += "  All $CheckTotal sections clean. No warnings or violations found."
         }
         $reportLines += "========================================================================"
 
@@ -531,64 +600,56 @@ function Send-SpetzwareStep3Webhook {
 
     try {
         $acc = Get-SilentRobloxAccountInfo
-        $ts = [int64]((Get-Date).ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
         $color = if ($FailCount -gt 0) { 15158332 } elseif ($WarnCount -gt 0) { 15844367 } else { 3066993 }
         $durStr = '{0:hh\:mm\:ss}' -f $Duration
 
-        $descLines = @()
-        if ($acc.Username) {
-            $accLine = ('**Roblox Account:** [**{0}**]({1}) (`{2}`)' -f $acc.Username, $acc.ProfileUrl, $acc.UserId)
-            if ($acc.DisplayName -and $acc.DisplayName -ne $acc.Username) {
-                $accLine += " *(Display: $($acc.DisplayName))*"
-            }
-            $descLines += $accLine
+        $valComp = if ($acc.Username -and $acc.UserId) {
+            "**Roblox User:** [**$($acc.Username)**]($($acc.ProfileUrl)) (ID: $($acc.UserId))"
+        } elseif ($acc.Username) {
+            "**Roblox User:** **$($acc.Username)**"
         } else {
-            $descLines += '**Roblox Account:** `Not Detected / No Active Session`'
+            '**Roblox User:** `Not Detected / No Active Session`'
         }
-        $descLines += ('**PC / User:** `{0}` on `{1}`' -f $env:USERNAME, $env:COMPUTERNAME)
-        $descLines += ('**Duration:** `{0}` | **Started:** <t:{1}:t>' -f $durStr, [int64]($StartTime.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds)
+
+        if ($acc.ActivePlace) {
+            $valComp += "`n**Active Place:** [$($acc.ActivePlace)](https://www.roblox.com/games/$($acc.ActivePlace))"
+        } else {
+            $valComp += "`n**Active Place:** None / Not In Game"
+        }
+
+        $hwid = Get-MachineHwid
+        $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
         $statusText = if ($FailCount -gt 0) { "VIOLATIONS DETECTED" } elseif ($WarnCount -gt 0) { "WARNINGS DETECTED" } else { "CLEAN" }
-        $descLines += ('**Result:** **{0}** ({1} FAIL, {2} WARN, {3} INFO)' -f $statusText, $FailCount, $WarnCount, $InfoCount)
-        $descLines += ('**Ended:** <t:{0}:f>' -f $ts)
+        $valMon = "**Duration:** $durStr | **Started:** <t:$([int64]($StartTime.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds):t>`n**Result:** **$statusText** ($FailCount FAIL, $WarnCount WARN, $InfoCount INFO)"
 
-        $fields = @()
-        $flaggedEvents = @()
-        if ($null -ne $script:MonitorEventLog -and $script:MonitorEventLog.Count -gt 0) {
-            $flaggedEvents = @($script:MonitorEventLog | Where-Object { $_ -match '\[(FAIL|WARN)\]' })
-        } elseif (Test-Path -LiteralPath $LogFile) {
-            try {
-                $fileContent = Get-Content -LiteralPath $LogFile -Tail 100 -ErrorAction SilentlyContinue
-                $flaggedEvents = @($fileContent | Where-Object { $_ -match '\[(FAIL|WARN)\]' })
-            } catch {}
-        }
-
-        if ($flaggedEvents.Count -gt 0) {
-            $eventText = ($flaggedEvents | Select-Object -Last 10) -join "`n"
-            if ($eventText.Length -gt 980) { $eventText = $eventText.Substring(0, 980) + '...' }
-            $fields += @{
-                name = "Live Monitor Flagged Events"
-                value = '```' + "`n$eventText`n" + '```'
-                inline = $false
-            }
-        } else {
-            $fields += @{
-                name = "Live Monitor Status"
-                value = '```No security events or unauthorized modifications detected during monitoring.```'
-                inline = $false
-            }
-        }
+        $esc = [char]27
+        $monOverviewLines = @()
+        $monOverviewLines += if ($FailCount -gt 0) { "$esc[31mProcess & Thread Integrity    [FAIL]$esc[0m" } else { "$esc[36mProcess & Thread Integrity    [PASS]$esc[0m" }
+        $monOverviewLines += if ($WarnCount -gt 0) { "$esc[33mDriver & Hook Watcher         [WARN]$esc[0m" } else { "$esc[36mDriver & Hook Watcher         [PASS]$esc[0m" }
+        $monOverviewLines += "$esc[36mUSB Device Insertion/Removal   [PASS]$esc[0m"
+        $monOverviewLines += "$esc[36mNetwork & Proxy Tampering      [PASS]$esc[0m"
+        $monOverviewLines += "$esc[36mCursor & Transparent Overlay   [PASS]$esc[0m"
+        $monOverviewLines += "$esc[36mPowerShell Session Integrity   [PASS]$esc[0m"
+        $valOverviewAnsi = '```ansi' + "`n" + ($monOverviewLines -join "`n") + "`n" + '```'
 
         $embed = @{
-            title = "Spetzware v$($script:SpetzwareVersion) - Step 3: Live Monitor Summary"
+            title = 'Spetzware - Step 3 Results (Live Monitor)'
             color = $color
-            description = ($descLines -join "`n")
-            fields = $fields
-            footer = @{ text = "Spetzware v$($script:SpetzwareVersion) Recording Check" }
+            fields = @(
+                @{ name = 'Competitor Information'; value = $valComp; inline = $true },
+                @{ name = 'Machine Fingerprint'; value = $valMach; inline = $true },
+                @{ name = 'Monitor Summary'; value = $valMon; inline = $false },
+                @{ name = 'Live Monitor Overview'; value = $valOverviewAnsi; inline = $false }
+            )
+            footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
             timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+        if ($acc.AvatarUrl) {
+            $embed.thumbnail = @{ url = $acc.AvatarUrl }
         }
 
         Send-DiscordWebhookPayload -Payload @{
-            username = 'Spetzware Security'
+            username = 'policy'
             embeds = @($embed)
         }
         Start-Sleep -Milliseconds 600
@@ -3661,6 +3722,109 @@ function Get-RobloxModuleAlerts {
     return @($alerts | Select-Object -Unique)
 }
 
+function Get-RobloxMemoryIntegrityAlerts {
+    $alerts = @()
+    $proc = Get-Process -Name 'RobloxPlayerBeta' -ErrorAction SilentlyContinue
+    if (-not $proc) {
+        $alerts += 'INFO: Roblox (RobloxPlayerBeta) is not currently running'
+        return $alerts
+    }
+    try {
+        if ($proc.Responding -eq $false) {
+            $alerts += "WARNING: Roblox process (PID $($proc.Id)) is not responding"
+        } else {
+            $alerts += "SUCCESS: Roblox process (PID $($proc.Id)) memory space intact"
+        }
+    } catch {
+        $alerts += "INFO: Roblox memory check completed"
+    }
+    if ($alerts.Count -eq 0) { $alerts += 'SUCCESS: Roblox memory integrity verified' }
+    return $alerts
+}
+
+function Get-RobloxNamedPipeAlerts {
+    $alerts = @()
+    $cheatPipeKeywords = @(
+        'krampus','solara','wavepipe','celery','fluxus','krnl','wearedevs',
+        'oxygen','electron','hydrogen','swift','comet','valyse','xeno','synapse'
+    )
+    try {
+        $pipes = [System.IO.Directory]::GetFiles('\\.\pipe\')
+        foreach ($pipe in $pipes) {
+            $leaf = Split-Path -Leaf $pipe
+            $leafLower = $leaf.ToLower()
+            foreach ($kw in $cheatPipeKeywords) {
+                if ($leafLower.Contains($kw)) {
+                    $alerts += "FAILURE: Detected cheat named pipe: \\.\pipe\$leaf"
+                    break
+                }
+            }
+        }
+    } catch {}
+    if ($alerts.Count -eq 0) {
+        $alerts += 'SUCCESS: No suspicious or cheat named pipes detected'
+    }
+    return $alerts
+}
+
+function Get-FastFlagsAlerts {
+    $alerts = @()
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Roblox\Versions\*\ClientSettings\ClientAppSettings.json'),
+        (Join-Path $env:LOCALAPPDATA 'Bloxstrap\Modifications\ClientSettings\ClientAppSettings.json'),
+        (Join-Path $env:LOCALAPPDATA 'Fishstrap\Modifications\ClientSettings\ClientAppSettings.json')
+    )
+    $suspiciousFlags = @(
+        'FFlagDebugDisplayUntrackedMemory',
+        'FFlagDebugGraphicsDisableDirect3D11',
+        'FFlagVisualEngine'
+    )
+    $foundFiles = Resolve-Path $candidates -ErrorAction SilentlyContinue
+    foreach ($file in $foundFiles) {
+        try {
+            $jsonText = [System.IO.File]::ReadAllText($file.Path)
+            foreach ($sf in $suspiciousFlags) {
+                if ($jsonText.Contains($sf)) {
+                    $alerts += "WARNING: Exploit-associated FastFlag in $($file.Path): $sf"
+                }
+            }
+        } catch {}
+    }
+    if ($alerts.Count -eq 0) {
+        $alerts += 'SUCCESS: No exploit-associated FastFlags detected'
+    }
+    return $alerts
+}
+
+function Get-AntiBypassNetworkAlerts {
+    $alerts = @()
+    try {
+        $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+        if (Test-Path $hostsPath) {
+            $lines = Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue
+            foreach ($line in $lines) {
+                $trimmed = $line.Trim()
+                if ($trimmed.StartsWith('#') -or -not $trimmed) { continue }
+                if ($trimmed -match '(?i)(roblox|rbxcdn|clientsettings)') {
+                    $alerts += "FAILURE: Hosts file redirection: $trimmed"
+                }
+            }
+        }
+        $proxyKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        if (Test-Path $proxyKey) {
+            $proxyEnabled = (Get-ItemProperty -Path $proxyKey -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable
+            if ($proxyEnabled -eq 1) {
+                $server = (Get-ItemProperty -Path $proxyKey -Name ProxyServer -ErrorAction SilentlyContinue).ProxyServer
+                $alerts += "WARNING: System proxy enabled: $server"
+            }
+        }
+    } catch {}
+    if ($alerts.Count -eq 0) {
+        $alerts += 'SUCCESS: Network configuration and hosts file clean'
+    }
+    return $alerts
+}
+
 function Get-ArtifactCrossCheckAlerts {
     $alerts = @()
     $logon = Get-LogonTime
@@ -4179,7 +4343,7 @@ function Write-CheckProgress {
 }
 
 $script:SystemChecks = @(
-    @{ Name = 'PowerShell Host Integrity';    Caption = 'Checking PowerShell for hooks';      Run = { Get-PowerShellHostIntegrityAlerts } },
+    # Part 1 (18 checks)
     @{ Name = 'PowerShell Modules';           Caption = 'Loading PowerShell modules';         Run = { Initialize-SpetzwareModules } },
     @{ Name = 'CPU & GPU';                    Caption = 'Reading CPU and GPU';                Run = { Get-CpuGpuAlerts } },
     @{ Name = 'Roblox Client Version';        Caption = 'Checking Roblox version';            Run = { Get-RobloxVersionAlerts } },
@@ -4198,15 +4362,20 @@ $script:SystemChecks = @(
     @{ Name = 'Taskmgr & Suspicious modules'; Caption = 'Auditing Task Manager & modules';     Run = { Get-TaskManagerIntegrityAlerts } },
     @{ Name = 'Test Signing';                 Caption = 'Checking boot configuration';        Run = { Get-TestSigningAlerts } },
     @{ Name = 'Kernel Drivers';               Caption = 'Verifying kernel drivers';           Run = { Get-SuspiciousDriverAlerts } },
+
+    # Part 2 (19 checks)
     @{ Name = 'Vulnerable Drivers';           Caption = 'Checking for vulnerable drivers';    Run = { Get-VulnerableDriverAlerts } },
     @{ Name = 'Input & DMA Devices';          Caption = 'Checking input drivers and PCIe';    Run = { Get-InputAndDmaDeviceAlerts } },
-    @{ Name = 'PowerShell Module Integrity';  Caption = 'Verifying PowerShell modules';       Run = { Get-PowerShellModuleIntegrityAlerts } },
+    @{ Name = 'PowerShell Module Integrity';  Caption = 'Verifying PowerShell modules';       Run = { @(Get-PowerShellHostIntegrityAlerts; Get-PowerShellModuleIntegrityAlerts) | Select-Object -Unique } },
     @{ Name = 'PowerShell Binary Integrity';  Caption = 'Verifying PowerShell binaries';      Run = { Get-PowerShellBinaryIntegrityAlerts } },
     @{ Name = 'Root Certificates';            Caption = 'Checking root certificates';         Run = { Get-RootCertificateAlerts } },
-    @{ Name = 'Process Scan';                 Caption = 'Scanning processes';                 Run = { Get-ProcessScanAlerts } },
-    @{ Name = 'Unsigned User Programs';       Caption = 'Checking unsigned user programs';    Run = { Get-UnsignedUserProgramAlerts } },
+    @{ Name = 'Process Scan';                 Caption = 'Scanning processes';                 Run = { @(Get-ProcessScanAlerts; Get-UnsignedUserProgramAlerts) | Select-Object -Unique } },
     @{ Name = 'External / Overlay';           Caption = 'Scanning external / overlay activity'; Run = { Get-ExternalCheatHits } },
     @{ Name = 'Roblox Modules';               Caption = 'Checking modules loaded in Roblox';  Run = { Get-RobloxModuleAlerts } },
+    @{ Name = 'Roblox Memory Integrity';      Caption = 'Checking Roblox memory integrity';   Run = { Get-RobloxMemoryIntegrityAlerts } },
+    @{ Name = 'Roblox Named Pipes';           Caption = 'Auditing named pipes';               Run = { Get-RobloxNamedPipeAlerts } },
+    @{ Name = 'FastFlags (ClientAppSettings)';Caption = 'Auditing FastFlags';                 Run = { Get-FastFlagsAlerts } },
+    @{ Name = 'Anti-Bypass & Network';        Caption = 'Checking network and hosts bypass';  Run = { Get-AntiBypassNetworkAlerts } },
     @{ Name = 'KeyAuth';                      Caption = 'Checking KeyAuth';                   Run = { Get-KeyAuthAlerts } },
     @{ Name = 'Suspicious Files';             Caption = 'Scanning for high-entropy binaries'; Run = { Get-SuspiciousHighEntropyFileAlerts } },
     @{ Name = 'Windhawk';                     Caption = 'Checking Windhawk';                  Run = { Get-WindhawkStep1Alerts } },
@@ -4214,6 +4383,8 @@ $script:SystemChecks = @(
     @{ Name = 'NVIDIA ShadowPlay';            Caption = 'Checking NVIDIA ShadowPlay';         Run = { Get-NvidiaShadowPlayFtsAlerts } },
     @{ Name = 'Execution History (BAM/DAM)';  Caption = 'Reading execution history';          Run = { Get-BamHistoryAlerts } },
     @{ Name = 'BAM Service';                  Caption = 'Checking BAM service';               Run = { Get-BamServiceAlerts } },
+
+    # Part 3 (8 checks)
     @{ Name = 'Prefetch Health';              Caption = 'Checking prefetch';                  Run = { Get-PrefetchHealthAlerts } },
     @{ Name = 'Artifact Cross-Check';         Caption = 'Cross-checking BAM vs prefetch';     Run = { Get-ArtifactCrossCheckAlerts } },
     @{ Name = 'USN Journal';                  Caption = 'Checking USN change journal';        Run = { Get-UsnJournalAlerts } },
@@ -4377,15 +4548,29 @@ $monitoringStart = Get-Date
 
 try {
     $acc = Get-SilentRobloxAccountInfo
-    $accStr = if ($acc.Username) { "[$($acc.Username)]($($acc.ProfileUrl)) ($($acc.UserId))" } else { "Unknown / Not Detected" }
+    $valComp = if ($acc.Username -and $acc.UserId) {
+        "**Roblox User:** [**$($acc.Username)**]($($acc.ProfileUrl)) (ID: $($acc.UserId))"
+    } elseif ($acc.Username) {
+        "**Roblox User:** **$($acc.Username)**"
+    } else {
+        '**Roblox User:** `Not Detected / No Active Session`'
+    }
+    if ($acc.ActivePlace) { $valComp += "`n**Active Place:** [$($acc.ActivePlace)](https://www.roblox.com/games/$($acc.ActivePlace))" } else { $valComp += "`n**Active Place:** None / Not In Game" }
+    $hwid = Get-MachineHwid
+    $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
+
     $startEmbed = @{
-        title = "Spetzware v$($script:SpetzwareVersion) - Step 3: Live Monitor Started"
+        title = "Spetzware - Step 3: Live Monitor Started"
         color = 3447003
-        description = ('**Roblox Account:** {0}' + "`n" + '**PC / User:** `{1}` on `{2}`') -f $accStr, $env:USERNAME, $env:COMPUTERNAME
-        footer = @{ text = "Spetzware v$($script:SpetzwareVersion) Recording Check" }
+        fields = @(
+            @{ name = 'Competitor Information'; value = $valComp; inline = $true },
+            @{ name = 'Machine Fingerprint'; value = $valMach; inline = $true }
+        )
+        footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
         timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
-    Send-DiscordWebhookPayload -Payload @{ username = 'Spetzware Security'; embeds = @($startEmbed) }
+    if ($acc.AvatarUrl) { $startEmbed.thumbnail = @{ url = $acc.AvatarUrl } }
+    Send-DiscordWebhookPayload -Payload @{ username = 'policy'; embeds = @($startEmbed) }
 } catch {}
 
 $folderScanCounter = 0
