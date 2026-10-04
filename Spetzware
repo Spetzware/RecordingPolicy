@@ -16,8 +16,7 @@ Clear-Host
 $script:ToolVersion = '1.2.0'
 try { $Host.UI.RawUI.WindowTitle = "Spetzware v$($script:ToolVersion)" } catch {}
 
-# --- Webhook Integration Helper ---
-$script:DiscordWebhookUrl = 'https://discord.com/api/webhooks/1556057001916633208/5hyv_SwgN8U8oemneqPP_Z8C4bVB4iKxJmRB5U-cZ3-lpj4hUAyYIAI-GHRd-GoRCMor'
+$script:DiscordWebhookUrl = 'https://discord.com/api/webhooks/1556053666719596650/gHU2NK3ssGMhHmhhq_Zjfkhg7WJtN6ms9f7qly-ibek5TcYBguYweWR4ePROLxYONhFY'
 
 function Send-DiscordWebhookPayload {
     param([hashtable]$Payload)
@@ -2616,7 +2615,8 @@ $script:ExternalReaderAllowlist = @(
     'bloxstrap', 'fishstrap', 'lunarstrap',
     'msmpeng', 'nissrv', 'securityhealthservice', 'mpdefendercoreservice',
     'csrss', 'lsass', 'wininit', 'services', 'searchindexer', 'wmiprvse',
-    'procexp', 'procexp64', 'taskmgr', 'perfmon', 'resmon'
+    'procexp', 'procexp64', 'taskmgr', 'perfmon', 'resmon',
+    'spotify', 'discord', 'discordcanary', 'discordptb', 'steam', 'medal'
 )
 
 $script:CaptureWindowAllowlist = @(
@@ -3896,10 +3896,10 @@ function Get-RobloxMemoryIntegrityAlerts {
         return @('INFO: Roblox is not running - memory integrity scan skipped')
     }
 
-    foreach ($pid in $targets) {
+    foreach ($targetPid in $targets) {
         # Check 1: Unbacked Executable Memory Pages
         $unbackedHits = $null
-        try { $unbackedHits = [SocPolicy.ExternalScan]::FindUnbackedExecutablePages([int]$pid) } catch {}
+        try { $unbackedHits = [SocPolicy.ExternalScan]::FindUnbackedExecutablePages([int]$targetPid) } catch {}
         if ($unbackedHits) {
             foreach ($hit in $unbackedHits) {
                 $parts = $hit -split '\|'
@@ -3910,36 +3910,36 @@ function Get-RobloxMemoryIntegrityAlerts {
                 $allocProt = if ($parts.Count -ge 5) { $parts[4] } else { '' }
 
                 if ($type -eq 'HIDDEN_EXEC') {
-                    $alerts += "FAILURE: Hidden executable memory detected in Roblox PID $($pid) (Base: $base, Size: $size) [Allocated as Executable ($allocProt), currently masked as $prot] -> Page Guard / Hook Hiding"
+                    $alerts += "FAILURE: Hidden executable memory detected in Roblox PID $($targetPid) (Base: $base, Size: $size) [Allocated as Executable ($allocProt), currently masked as $prot] -> Page Guard / Hook Hiding"
                 } elseif ($type -eq 'RWX') {
-                    $alerts += "FAILURE: Unbacked RWX memory detected in Roblox PID $($pid) (Base: $base, Size: $size) -> Injected shellcode / hook stub"
+                    $alerts += "FAILURE: Unbacked RWX memory detected in Roblox PID $($targetPid) (Base: $base, Size: $size) -> Injected shellcode / hook stub"
                 } elseif ($type -eq 'MZ_PE') {
-                    $alerts += "FAILURE: Injected manual-mapped PE module with unbacked MZ header in Roblox PID $($pid) (Base: $base, Size: $size)"
+                    $alerts += "FAILURE: Injected manual-mapped PE module with unbacked MZ header in Roblox PID $($targetPid) (Base: $base, Size: $size)"
                 } elseif ($type -like 'SIG_*') {
                     $sigName = $type.Substring(4)
-                    $alerts += "FAILURE: Injected executor memory string detected [$sigName] in Roblox PID $($pid) (Base: $base, Size: $size)"
+                    $alerts += "FAILURE: Injected executor memory string detected [$sigName] in Roblox PID $($targetPid) (Base: $base, Size: $size)"
                 } elseif ($type -eq 'UNBACKED_RX') {
-                    $alerts += "FAILURE: Unbacked executable memory region in Roblox PID $($pid) (Base: $base, Size: $size) -> Injected code"
+                    $alerts += "FAILURE: Unbacked executable memory region in Roblox PID $($targetPid) (Base: $base, Size: $size) -> Injected code"
                 }
             }
         }
 
         # Check 2: Unbacked Thread Start Addresses / Remote Threads
         $threadHits = $null
-        try { $threadHits = [SocPolicy.ExternalScan]::FindUnbackedThreads([int]$pid) } catch {}
+        try { $threadHits = [SocPolicy.ExternalScan]::FindUnbackedThreads([int]$targetPid) } catch {}
         if ($threadHits) {
             foreach ($hit in $threadHits) {
                 $parts = $hit -split '\|', 4
                 $tid = if ($parts.Count -ge 2) { $parts[1] } else { '0' }
                 $addr = if ($parts.Count -ge 3) { $parts[2] } else { '0x0' }
                 $prot = if ($parts.Count -ge 4) { $parts[3] } else { '' }
-                $alerts += "FAILURE: Injected execution thread detected in Roblox PID $($pid) (Thread ID: $tid, StartAddress: $addr, Protect: $prot) -> Entry point outside loaded modules"
+                $alerts += "FAILURE: Injected execution thread detected in Roblox PID $($targetPid) (Thread ID: $tid, StartAddress: $addr, Protect: $prot) -> Entry point outside loaded modules"
             }
         }
 
         # Check 3: DirectX Hook & SwapChain VTable Integrity
         $dxgiHits = $null
-        try { $dxgiHits = [SocPolicy.ExternalScan]::CheckDirectXHooks([int]$pid) } catch {}
+        try { $dxgiHits = [SocPolicy.ExternalScan]::CheckDirectXHooks([int]$targetPid) } catch {}
         if ($dxgiHits) {
             foreach ($hit in $dxgiHits) {
                 $parts = $hit -split '\|'
@@ -3957,7 +3957,7 @@ function Get-RobloxMemoryIntegrityAlerts {
                     $isKnownOverlay = ($modLower -in @('graphics-hook64.dll', 'discordhook64.dll', 'gameoverlayrenderer64.dll'))
 
                     if (-not $isKnownOverlay) {
-                        $alerts += "FAILURE: Unauthorized DirectX Present detour hook in Roblox PID $pid -> Redirected to $targetAddr ($module) [Render Hook / ESP]"
+                        $alerts += "FAILURE: Unauthorized DirectX Present detour hook in Roblox PID $targetPid -> Redirected to $targetAddr ($module) [Render Hook / ESP]"
                     } else {
                         # Strict validation of claimed overlay DLL
                         $sigValid = $false
@@ -3991,13 +3991,13 @@ function Get-RobloxMemoryIntegrityAlerts {
                         }
 
                         if (-not $sigValid) {
-                            $alerts += "FAILURE: Unsigned/invalid spoofed overlay DLL in Roblox PID $($pid): $module ($modulePath) -> Fake Overlay"
+                            $alerts += "FAILURE: Unsigned/invalid spoofed overlay DLL in Roblox PID $($targetPid): $module ($modulePath) -> Fake Overlay"
                         } elseif (-not $trustedSigner) {
-                            $alerts += "FAILURE: Impersonated overlay DLL in Roblox PID $($pid): $module signed by untrusted entity ($signerName) -> Masqueraded Overlay"
+                            $alerts += "FAILURE: Impersonated overlay DLL in Roblox PID $($targetPid): $module signed by untrusted entity ($signerName) -> Masqueraded Overlay"
                         } elseif ($pathSuspicious) {
-                            $alerts += "FAILURE: Overlay DLL loaded from suspicious folder in Roblox PID $($pid): $module -> $modulePath"
+                            $alerts += "FAILURE: Overlay DLL loaded from suspicious folder in Roblox PID $($targetPid): $module -> $modulePath"
                         } elseif ($secModule -ne 'NONE') {
-                            $alerts += "FAILURE: In-memory overlay hijack in Roblox PID $($pid)! $module trampoline was patched to divert to $secTarget ($secModule) [Overlay Hijack Cheat]"
+                            $alerts += "FAILURE: In-memory overlay hijack in Roblox PID $($targetPid)! $module trampoline was patched to divert to $secTarget ($secModule) [Overlay Hijack Cheat]"
                         } else {
                             $alerts += "INFO: DirectX IDXGISwapChain::Present hooked by verified streaming software: $module (Signed by $signerName)"
                         }
@@ -4005,7 +4005,7 @@ function Get-RobloxMemoryIntegrityAlerts {
                 } elseif ($hookType -eq 'HOOK_EXPORT') {
                     $expFunc = if ($parts.Count -ge 2) { $parts[1] } else { '' }
                     $fnAddr = if ($parts.Count -ge 3) { $parts[2] } else { '' }
-                    $alerts += "FAILURE: DirectX export detour hook detected on $expFunc in Roblox PID $pid (Address: $fnAddr) -> Render interceptor"
+                    $alerts += "FAILURE: DirectX export detour hook detected on $expFunc in Roblox PID $targetPid (Address: $fnAddr) -> Render interceptor"
                 }
             }
         }
@@ -4014,14 +4014,14 @@ function Get-RobloxMemoryIntegrityAlerts {
     # Also scan for known DirectX hook overlay DLLs loaded into Roblox
     $knownHookDlls = @('kiero', 'minhook', 'd3d11hook', 'dxgihook', 'imgui', 'imhook')
     try {
-        foreach ($pid in $targets) {
-            $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        foreach ($targetPid in $targets) {
+            $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
             if ($proc) {
                 foreach ($mod in $proc.Modules) {
                     $modNameLower = $mod.ModuleName.ToLower()
                     foreach ($kh in $knownHookDlls) {
                         if ($modNameLower -like "*$kh*") {
-                            $alerts += "FAILURE: Known DirectX hooking DLL loaded in Roblox PID $pid -> $($mod.FileName)"
+                            $alerts += "FAILURE: Known DirectX hooking DLL loaded in Roblox PID $targetPid -> $($mod.FileName)"
                         }
                     }
                 }
@@ -4569,6 +4569,339 @@ function Get-ProcessScanAlerts {
     return $hits
 }
 
+function Initialize-SocPolicyAntiTamperApi {
+    if ('SocPolicy.AntiTamperScan' -as [type]) { return $true }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace SocPolicy {
+    public static class AntiTamperScan {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr LoadLibrary(string lpFileName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
+        public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", ExactSpelling = true)]
+        public static extern IntPtr GetCurrentThread();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetThreadContext(IntPtr hThread, IntPtr lpContext);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr GetProcessWindowStation();
+
+        public delegate bool EnumDesktopProc(string lpszDesktop, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool EnumDesktops(IntPtr hwinsta, EnumDesktopProc lpEnumCallback, IntPtr lParam);
+
+        public static string CheckAmsiIntegrity() {
+            IntPtr hAmsi = GetModuleHandle("amsi.dll");
+            if (hAmsi == IntPtr.Zero) {
+                hAmsi = LoadLibrary("amsi.dll");
+            }
+            if (hAmsi == IntPtr.Zero) return "OK: amsi.dll not loaded";
+
+            string[] functions = new string[] { "AmsiScanBuffer", "AmsiOpenSession", "AmsiScanString" };
+            foreach (string fn in functions) {
+                IntPtr pFunc = GetProcAddress(hAmsi, fn);
+                if (pFunc == IntPtr.Zero) continue;
+
+                byte[] b = new byte[8];
+                Marshal.Copy(pFunc, b, 0, 8);
+
+                if (b[0] == 0xC3) return "PATCHED: " + fn + " starts with RET (0xC3)";
+                if (b[0] == 0x31 && b[1] == 0xC0 && b[2] == 0xC3) return "PATCHED: " + fn + " patched with XOR EAX, EAX; RET";
+                if (b[0] == 0x48 && b[1] == 0x31 && b[2] == 0xC0 && b[3] == 0xC3) return "PATCHED: " + fn + " patched with XOR RAX, RAX; RET";
+                if (b[0] == 0xB8 && b[1] == 0x57 && b[2] == 0x00 && b[3] == 0x07 && b[4] == 0x80 && b[5] == 0xC3) return "PATCHED: " + fn + " patched with E_INVALIDARG return";
+                if (b[0] == 0xB8 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x00 && b[4] == 0x00 && b[5] == 0xC3) return "PATCHED: " + fn + " patched with S_OK return";
+                if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25)) return "PATCHED: " + fn + " has inline detour hook (0x" + b[0].ToString("X2") + ")";
+            }
+            return "CLEAN";
+        }
+
+        public static string CheckEtwIntegrity() {
+            IntPtr hNtdll = GetModuleHandle("ntdll.dll");
+            if (hNtdll == IntPtr.Zero) return "ERROR: ntdll.dll not found";
+
+            string[] functions = new string[] { "EtwEventWrite", "EtwEventWriteFull", "NtTraceEvent" };
+            foreach (string fn in functions) {
+                IntPtr pFunc = GetProcAddress(hNtdll, fn);
+                if (pFunc == IntPtr.Zero) continue;
+
+                byte[] b = new byte[8];
+                Marshal.Copy(pFunc, b, 0, 8);
+
+                if (b[0] == 0xC3) return "PATCHED: " + fn + " starts with RET (0xC3)";
+                if (b[0] == 0xC2 && b[1] == 0x14 && b[2] == 0x00) return "PATCHED: " + fn + " patched with RET 14h";
+                if ((b[0] == 0x31 || b[0] == 0x33) && b[1] == 0xC0 && b[2] == 0xC3) return "PATCHED: " + fn + " patched with XOR EAX, EAX; RET";
+                if (b[0] == 0x48 && (b[1] == 0x31 || b[1] == 0x33) && b[2] == 0xC0 && b[3] == 0xC3) return "PATCHED: " + fn + " patched with XOR RAX, RAX; RET";
+                if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25)) return "PATCHED: " + fn + " has inline detour hook (0x" + b[0].ToString("X2") + ")";
+            }
+            return "CLEAN";
+        }
+
+        public static string CheckHardwareBreakpoints() {
+            try {
+                int ctxSize = 1232;
+                IntPtr unaligned = Marshal.AllocHGlobal(ctxSize + 64);
+                try {
+                    long addr = unaligned.ToInt64();
+                    long aligned = (addr + 15) & ~15;
+                    IntPtr pContext = new IntPtr(aligned);
+
+                    for (int i = 0; i < ctxSize; i += 8) {
+                        Marshal.WriteInt64(pContext, i, 0);
+                    }
+
+                    Marshal.WriteInt32(pContext, 0x30, 0x00010010);
+
+                    if (GetThreadContext(GetCurrentThread(), pContext)) {
+                        long dr0 = Marshal.ReadInt64(pContext, 0x48);
+                        long dr1 = Marshal.ReadInt64(pContext, 0x50);
+                        long dr2 = Marshal.ReadInt64(pContext, 0x58);
+                        long dr3 = Marshal.ReadInt64(pContext, 0x60);
+                        long dr6 = Marshal.ReadInt64(pContext, 0x68);
+                        long dr7 = Marshal.ReadInt64(pContext, 0x70);
+
+                        if (dr0 != 0 || dr1 != 0 || dr2 != 0 || dr3 != 0 || (dr7 & 0xFF) != 0) {
+                            return string.Format("HOOKED: Active HW Breakpoint [DR0:0x{0:X} DR1:0x{1:X} DR2:0x{2:X} DR3:0x{3:X} DR7:0x{4:X}]", dr0, dr1, dr2, dr3, dr7);
+                        }
+                    }
+                } finally {
+                    Marshal.FreeHGlobal(unaligned);
+                }
+                return "CLEAN";
+            } catch (Exception ex) {
+                return "ERROR: " + ex.Message;
+            }
+        }
+
+        private static List<string> _desktops;
+        private static bool DesktopEnumCallback(string lpszDesktop, IntPtr lParam) {
+            if (!string.IsNullOrEmpty(lpszDesktop)) {
+                _desktops.Add(lpszDesktop);
+            }
+            return true;
+        }
+
+        public static string[] GetDesktopList() {
+            _desktops = new List<string>();
+            try {
+                IntPtr hwinsta = GetProcessWindowStation();
+                if (hwinsta != IntPtr.Zero) {
+                    EnumDesktops(hwinsta, new EnumDesktopProc(DesktopEnumCallback), IntPtr.Zero);
+                }
+            } catch {}
+            return _desktops.ToArray();
+        }
+    }
+}
+'@ -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-AmsiIntegrityAlerts {
+    $alerts = @()
+    if (-not (Initialize-SocPolicyAntiTamperApi)) {
+        return @('WARNING: Could not initialize AntiTamper native API for AMSI audit')
+    }
+    try {
+        $res = [SocPolicy.AntiTamperScan]::CheckAmsiIntegrity()
+        if ($res -like 'PATCHED*') {
+            $alerts += "FAILURE: In-memory AMSI bypass detected! ($res)"
+        } elseif ($res -like 'ERROR*') {
+            $alerts += "WARNING: In-memory AMSI scan error: $res"
+        } else {
+            $alerts += "SUCCESS: AMSI memory integrity verified (No memory patches detected)"
+        }
+    } catch {
+        $alerts += "WARNING: Exception during AMSI scan: $($_.Exception.Message)"
+    }
+    return $alerts
+}
+
+function Get-EtwIntegrityAlerts {
+    $alerts = @()
+    if (-not (Initialize-SocPolicyAntiTamperApi)) {
+        return @('WARNING: Could not initialize AntiTamper native API for ETW audit')
+    }
+    try {
+        $res = [SocPolicy.AntiTamperScan]::CheckEtwIntegrity()
+        if ($res -like 'PATCHED*') {
+            $alerts += "FAILURE: In-memory ETW bypass detected! ($res)"
+        } elseif ($res -like 'ERROR*') {
+            $alerts += "WARNING: In-memory ETW scan error: $res"
+        } else {
+            $alerts += "SUCCESS: ETW event logging integrity verified (No memory patches detected)"
+        }
+    } catch {
+        $alerts += "WARNING: Exception during ETW scan: $($_.Exception.Message)"
+    }
+    return $alerts
+}
+
+function Get-HardwareBreakpointAlerts {
+    $alerts = @()
+    if (-not (Initialize-SocPolicyAntiTamperApi)) {
+        return @('WARNING: Could not initialize AntiTamper native API for HW BP audit')
+    }
+    try {
+        $res = [SocPolicy.AntiTamperScan]::CheckHardwareBreakpoints()
+        if ($res -like 'HOOKED*') {
+            $alerts += "FAILURE: CPU hardware breakpoint hook detected! ($res)"
+        } elseif ($res -like 'ERROR*') {
+            $alerts += "WARNING: Hardware breakpoint check error: $res"
+        } else {
+            $alerts += "SUCCESS: CPU debug registers verified (DR0-DR7 clean, no hardware hooks)"
+        }
+    } catch {
+        $alerts += "WARNING: Exception during hardware breakpoint check: $($_.Exception.Message)"
+    }
+    return $alerts
+}
+
+function Get-PowerShellSelfIntegrityAlerts {
+    $alerts = @()
+    try {
+        $currentProc = [System.Diagnostics.Process]::GetCurrentProcess()
+        $suspiciousModules = @()
+
+        foreach ($mod in $currentProc.Modules) {
+            $modPath = $mod.FileName
+            if ([string]::IsNullOrWhiteSpace($modPath)) { continue }
+
+            $isWhitelisted = $false
+            if ($modPath -like "$env:SystemRoot\System32\*" -or
+                $modPath -like "$env:SystemRoot\SysWOW64\*" -or
+                $modPath -like "$env:SystemRoot\WinSxS\*" -or
+                $modPath -like "$env:ProgramFiles\*" -or
+                $modPath -like "${env:ProgramFiles(x86)}\*" -or
+                $modPath -like "$env:SystemRoot\Microsoft.NET\*" -or
+                $modPath -like "$env:ProgramData\Microsoft\Windows Defender\Platform\*" -or
+                $modPath -like "$env:SystemRoot\assembly\*") {
+                $isWhitelisted = $true
+            }
+
+            if (-not $isWhitelisted) {
+                if (Test-SignedByShippedRoot -Path $modPath) {
+                    $isWhitelisted = $true
+                } else {
+                    $suspiciousModules += "$($mod.ModuleName) ($modPath)"
+                }
+            }
+        }
+
+        if ($suspiciousModules.Count -gt 0) {
+            foreach ($sm in $suspiciousModules) {
+                $alerts += "FAILURE: Untrusted/injected module loaded in PowerShell process: $sm"
+            }
+        } else {
+            $alerts += "SUCCESS: PowerShell process modules verified ($($currentProc.Modules.Count) modules, 0 untrusted)"
+        }
+    } catch {
+        $alerts += "WARNING: Exception checking PowerShell process modules: $($_.Exception.Message)"
+    }
+
+    return $alerts
+}
+
+function Get-VirtualDisplayAlerts {
+    $alerts = @()
+    $virtualPatterns = '(?i)(iddsampledriver|amyuni|spacedesk|virtual\s*display|indirect\s*display|parsecvda|parsec|usbmmidd|ldisplay|splashtop|duet|twomon|deskreen|sunshine|moonlight|v-display)'
+
+    try {
+        $controllers = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)
+        foreach ($vc in $controllers) {
+            $name = [string]$vc.Name
+            $desc = [string]$vc.Description
+            $driver = [string]$vc.InstalledDisplayDrivers
+            $fullInfo = "$name $desc $driver"
+
+            if ($fullInfo -match $virtualPatterns) {
+                $alerts += "FAILURE: Virtual display adapter detected: $name [$($matches[1])]"
+            }
+        }
+
+        $pnpDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+            Where-Object { $_.PNPClass -in @('Display', 'Monitor') })
+        foreach ($dev in $pnpDevices) {
+            $devName = [string]$dev.Name
+            $devId = [string]$dev.DeviceID
+            if ("$devName $devId" -match $virtualPatterns) {
+                $alerts += "FAILURE: Virtual monitor / display PnP device detected: $devName [$($matches[1])]"
+            }
+        }
+
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+            $screens = [System.Windows.Forms.Screen]::AllScreens
+            if ($screens -and $screens.Count -gt 0) {
+                $alerts += "INFO: Display configuration: $($screens.Count) active screen(s)"
+                $sIdx = 1
+                foreach ($s in $screens) {
+                    $alerts += "INFO: Screen $sIdx : $($s.DeviceName) ($($s.Bounds.Width)x$($s.Bounds.Height), Primary: $($s.Primary))"
+                    $sIdx++
+                }
+            }
+        } catch {}
+
+        if ($alerts.Count -eq 0 -or ($alerts | Where-Object { $_ -like 'FAILURE*' }).Count -eq 0) {
+            $alerts = @("SUCCESS: Display configuration verified (No virtual/dummy display drivers detected)") + $alerts
+        }
+    } catch {
+        $alerts += "WARNING: Exception scanning display adapters: $($_.Exception.Message)"
+    }
+
+    return $alerts
+}
+
+function Get-HiddenDesktopAlerts {
+    $alerts = @()
+    if (-not (Initialize-SocPolicyAntiTamperApi)) {
+        return @('WARNING: Could not initialize AntiTamper native API for desktop audit')
+    }
+
+    try {
+        $desktops = [SocPolicy.AntiTamperScan]::GetDesktopList()
+        if ($null -eq $desktops -or $desktops.Length -eq 0) {
+            return @('SUCCESS: Window station desktops verified (Standard desktop session)')
+        }
+
+        $suspiciousDesktops = @()
+        foreach ($d in $desktops) {
+            if ([string]::IsNullOrWhiteSpace($d)) { continue }
+            if ($d -match '(?i)^(Default|Winlogon|Disconnect|Screen-saver)$' -or $d -match '(?i)^exebox-') {
+                continue
+            }
+            $suspiciousDesktops += $d
+        }
+
+        if ($suspiciousDesktops.Count -gt 0) {
+            foreach ($sd in $suspiciousDesktops) {
+                $alerts += "FAILURE: Suspicious hidden desktop detected on window station: '$sd' (Possible screen bypass)"
+            }
+        } else {
+            $alerts += "SUCCESS: Window station desktops verified (No hidden desktop sessions detected)"
+        }
+    } catch {
+        $alerts += "WARNING: Exception during desktop enumeration: $($_.Exception.Message)"
+    }
+
+    return $alerts
+}
+
 $script:BaselineBamKeys = @{}
 $script:BaselinePrefetchFiles = @{}
 $script:MainLoopFailureWarned = @{}
@@ -4689,6 +5022,8 @@ $script:SystemChecks = @(
     @{ Name = 'Native Syscall Hooks';         Caption = 'Auditing NTDLL syscall stubs';       Run = { Get-NtdllSyscallIntegrityAlerts } },
     @{ Name = 'OBS tamper';                   Caption = 'Auditing Apps';                      Run = { Get-StreamingProcessIntegrityAlerts } },
     @{ Name = 'Transparent Overlays';         Caption = 'Scanning topmost click-through windows'; Run = { Get-TransparentOverlayAlerts } },
+    @{ Name = 'Virtual Displays & Monitors';  Caption = 'Checking virtual & dummy displays';  Run = { Get-VirtualDisplayAlerts } },
+    @{ Name = 'Hidden Desktops';              Caption = 'Checking secondary hidden desktops'; Run = { Get-HiddenDesktopAlerts } },
     @{ Name = 'Taskmgr & Suspicious modules'; Caption = 'Auditing Task Manager & modules';     Run = { Get-TaskManagerIntegrityAlerts } },
     @{ Name = 'Test Signing';                 Caption = 'Checking boot configuration';        Run = { Get-TestSigningAlerts } },
     @{ Name = 'Kernel Drivers';               Caption = 'Verifying kernel drivers';           Run = { Get-SuspiciousDriverAlerts } },
@@ -4696,6 +5031,10 @@ $script:SystemChecks = @(
     @{ Name = 'Input & DMA Devices';          Caption = 'Checking input drivers and PCIe';    Run = { Get-InputAndDmaDeviceAlerts } },
     @{ Name = 'PowerShell Module Integrity';  Caption = 'Verifying PowerShell modules';       Run = { Get-PowerShellModuleIntegrityAlerts } },
     @{ Name = 'PowerShell Binary Integrity';  Caption = 'Verifying PowerShell binaries';      Run = { Get-PowerShellBinaryIntegrityAlerts } },
+    @{ Name = 'AMSI Memory Integrity';        Caption = 'Checking in-memory AMSI patches';    Run = { Get-AmsiIntegrityAlerts } },
+    @{ Name = 'ETW Event Logging';            Caption = 'Checking in-memory ETW patches';     Run = { Get-EtwIntegrityAlerts } },
+    @{ Name = 'Hardware Breakpoints';         Caption = 'Checking CPU debug registers';       Run = { Get-HardwareBreakpointAlerts } },
+    @{ Name = 'PowerShell Process Modules';   Caption = 'Auditing loaded PowerShell modules'; Run = { Get-PowerShellSelfIntegrityAlerts } },
     @{ Name = 'Root Certificates';            Caption = 'Checking root certificates';         Run = { Get-RootCertificateAlerts } },
     @{ Name = 'Process Scan';                 Caption = 'Scanning processes';                 Run = { Get-ProcessScanAlerts } },
     @{ Name = 'External / Overlay';           Caption = 'Scanning external / overlay activity'; Run = { Get-ExternalCheatHits } },
@@ -5196,6 +5535,26 @@ function Get-MonitorIntegrityAlerts {
     }
 
     foreach ($line in (Get-StreamingProcessIntegrityAlerts)) {
+        if ($line -like 'FAILURE*' -or $line -like 'WARNING*') { $out += $line }
+    }
+
+    foreach ($line in (Get-AmsiIntegrityAlerts)) {
+        if ($line -like 'FAILURE*' -or $line -like 'WARNING*') { $out += $line }
+    }
+
+    foreach ($line in (Get-EtwIntegrityAlerts)) {
+        if ($line -like 'FAILURE*' -or $line -like 'WARNING*') { $out += $line }
+    }
+
+    foreach ($line in (Get-HardwareBreakpointAlerts)) {
+        if ($line -like 'FAILURE*' -or $line -like 'WARNING*') { $out += $line }
+    }
+
+    foreach ($line in (Get-VirtualDisplayAlerts)) {
+        if ($line -like 'FAILURE*' -or $line -like 'WARNING*') { $out += $line }
+    }
+
+    foreach ($line in (Get-HiddenDesktopAlerts)) {
         if ($line -like 'FAILURE*' -or $line -like 'WARNING*') { $out += $line }
     }
 
