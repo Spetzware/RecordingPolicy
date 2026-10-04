@@ -17,7 +17,7 @@ $script:ToolVersion = '1.2.0'
 try { $Host.UI.RawUI.WindowTitle = "Spetzware v$($script:ToolVersion)" } catch {}
 
 # --- Webhook Integration Helper ---
-$script:DiscordWebhookUrl = 'https://discord.com/api/webhooks/1556053666719596650/gHU2NK3ssGMhHmhhq_Zjfkhg7WJtN6ms9f7qly-ibek5TcYBguYweWR4ePROLxYONhFY'
+$script:DiscordWebhookUrl = 'https://discord.com/api/webhooks/1556057001916633208/5hyv_SwgN8U8oemneqPP_Z8C4bVB4iKxJmRB5U-cZ3-lpj4hUAyYIAI-GHRd-GoRCMor'
 
 function Send-DiscordWebhookPayload {
     param([hashtable]$Payload)
@@ -42,6 +42,7 @@ function Send-DiscordWebhookPayload {
             return $false
         }
 
+        $delivered = $false
         try {
             $req = [System.Net.HttpWebRequest]::Create($script:DiscordWebhookUrl)
             $req.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy()
@@ -57,8 +58,23 @@ function Send-DiscordWebhookPayload {
 
             $resp = $req.GetResponse()
             $resp.Close()
-        } finally {
+            $delivered = $true
+        } catch {}
+        finally {
             [Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCallback
+        }
+
+        if (-not $delivered) {
+            try {
+                $curl = (Get-Command 'curl.exe' -ErrorAction SilentlyContinue).Source
+                if (-not $curl) { $curl = "$env:SystemRoot\System32\curl.exe" }
+                if (Test-Path -LiteralPath $curl) {
+                    $tempJson = Join-Path $env:TEMP ('discord_payload_' + [guid]::NewGuid().ToString('N') + '.json')
+                    [System.IO.File]::WriteAllBytes($tempJson, $utf8Bytes)
+                    & $curl -s -o NUL --noproxy "*" -X POST $script:DiscordWebhookUrl -H "Content-Type: application/json; charset=utf-8" -d "@$tempJson"
+                    Remove-Item -LiteralPath $tempJson -Force -ErrorAction SilentlyContinue
+                }
+            } catch {}
         }
     } catch {}
 }
@@ -90,6 +106,7 @@ function Get-ActiveRobloxSessionDetails {
         Username    = "Not Detected"
         DisplayName = "Not Detected"
         ProfileUrl  = "N/A"
+        AvatarUrl   = $null
         PlaceId     = "Unknown / Not Detected"
         GameUrl     = "N/A"
         LogFile     = $null
@@ -106,7 +123,7 @@ function Get-ActiveRobloxSessionDetails {
         if (Test-Path -LiteralPath $dir) {
             $candidateLogs += Get-ChildItem -Path $dir -Filter "*_Player_*.log" -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -notmatch 'CrashHandler' } |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 5
+                Sort-Object LastWriteTime -Descending | Select-Object -First 15
         }
     }
 
@@ -139,6 +156,14 @@ function Get-ActiveRobloxSessionDetails {
                 } catch {
                     $session.Username = "ID: $($session.UserId)"
                 }
+
+                try {
+                    $thumbRes = Invoke-RestMethod -Uri "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=$($session.UserId)&size=150x150&format=Png&isCircular=false" -Method Get -TimeoutSec 3 -ErrorAction Stop
+                    if ($thumbRes -and $thumbRes.data -and $thumbRes.data[0].imageUrl) {
+                        $session.AvatarUrl = $thumbRes.data[0].imageUrl
+                    }
+                } catch {}
+
                 break
             }
         } catch {}
@@ -287,25 +312,32 @@ function Write-MonitorAlert {
     }
 
     if ($Level -in @('FAIL', 'WARN')) {
+        if (-not $script:RbxSession.UserId) {
+            $script:RbxSession = Get-ActiveRobloxSessionDetails
+        }
+        $playerDesc = if ($script:RbxSession.ProfileUrl -and $script:RbxSession.ProfileUrl -ne "N/A") {
+            "**Roblox User:** [$($script:RbxSession.Username)]($($script:RbxSession.ProfileUrl)) (ID: $($script:RbxSession.UserId))`n**PC:** $($env:USERNAME) on $($env:COMPUTERNAME)"
+        } else {
+            "**Player:** $($script:RbxSession.Username)`n**PC:** $($env:USERNAME) on $($env:COMPUTERNAME)"
+        }
         $colorInt = if ($Level -eq 'FAIL') { 15158332 } else { 15844367 }
-        $liveEmbed = @{
-            embeds = @(
+        $liveEmbedObj = @{
+            title       = "Live Monitor Event: [$Level]"
+            description = $playerDesc
+            color       = $colorInt
+            fields      = @(
                 @{
-                    title = "Live Monitor Event: [$Level]"
-                    description = "**Player:** $($script:RbxSession.Username)`n**PC:** $($env:USERNAME) on $($env:COMPUTERNAME)"
-                    color = $colorInt
-                    fields = @(
-                        @{
-                            name = "Alert"
-                            value = $text
-                            inline = $false
-                        }
-                    )
-                    timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    name   = "Alert"
+                    value  = $text
+                    inline = $false
                 }
             )
+            timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         }
-        Send-DiscordWebhookPayload -Payload $liveEmbed
+        if ($script:RbxSession.AvatarUrl) {
+            $liveEmbedObj['thumbnail'] = @{ url = $script:RbxSession.AvatarUrl }
+        }
+        Send-DiscordWebhookPayload -Payload @{ embeds = @($liveEmbedObj) }
     }
 }
 
@@ -4748,6 +4780,9 @@ Write-Rule
 Write-Host ''
 
 # --- Dispatch Step 1 Results to Discord Webhook (1:1 Complete Parity) ---
+if (-not $script:RbxSession.UserId) {
+    $script:RbxSession = Get-ActiveRobloxSessionDetails
+}
 $embedColor = if ($failCount -gt 0) { 15158332 } elseif ($warnCount -gt 0) { 15844367 } else { 3066993 }
 
 $e = [char]27
@@ -4905,7 +4940,7 @@ $allEmbeds = @()
 $firstEmbedFields = @(
     @{
         name   = "Competitor Information"
-        value  = "**Roblox:** $rbxProfileDisplay (ID: $($script:RbxSession.UserId))`n**Active Place:** $placeDisplay"
+        value  = "**Roblox User:** $rbxProfileDisplay (ID: $($script:RbxSession.UserId))`n**Active Place:** $placeDisplay"
         inline = $true
     },
     @{
@@ -4937,13 +4972,18 @@ foreach ($f in $firstEmbedFields) { $currentEmbedChars += $f.name.Length + $f.va
 foreach ($f in $sectionFields) {
     $fLen = $f.name.Length + $f.value.Length
     if (($currentEmbedFields.Count -ge 6) -or (($currentEmbedChars + $fLen) -gt 4500)) {
-        $allEmbeds += @{
+        $embedObj = @{
             title     = if ($embedIndex -eq 1) { "Spetzware - Step 1 Results" } else { "Spetzware - Step 1 Details (Part $embedIndex)" }
             color     = $embedColor
             fields    = $currentEmbedFields
             footer    = @{ text = "Spetzware Automated Integrity Monitor v$($script:ToolVersion)" }
             timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         }
+        if ($embedIndex -eq 1 -and $script:RbxSession.AvatarUrl) {
+            $embedObj['thumbnail'] = @{ url = $script:RbxSession.AvatarUrl }
+        }
+        $allEmbeds += $embedObj
+
         $embedIndex++
         $currentEmbedFields = @($f)
         $currentEmbedChars = $fLen
@@ -4954,13 +4994,17 @@ foreach ($f in $sectionFields) {
 }
 
 if ($currentEmbedFields.Count -gt 0) {
-    $allEmbeds += @{
+    $embedObj = @{
         title     = if ($embedIndex -eq 1) { "Spetzware - Step 1 Results" } else { "Spetzware - Step 1 Details (Part $embedIndex)" }
         color     = $embedColor
         fields    = $currentEmbedFields
         footer    = @{ text = "Spetzware Automated Integrity Monitor v$($script:ToolVersion)" }
         timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
+    if ($embedIndex -eq 1 -and $script:RbxSession.AvatarUrl) {
+        $embedObj['thumbnail'] = @{ url = $script:RbxSession.AvatarUrl }
+    }
+    $allEmbeds += $embedObj
 }
 
 # 5. Dispatch Embeds (in batches of up to 4 embeds per webhook POST)
@@ -5483,29 +5527,36 @@ while ($true) {
     $stopMsg = "Spetzware monitor stopped after {0:hh\:mm\:ss} ({1} fail, {2} warn, {3} info)" -f $elapsed, $script:MonitorAlertCounts.FAIL, $script:MonitorAlertCounts.WARN, $script:MonitorAlertCounts.INFO
     Write-MonitorAlert -Message $stopMsg -LogFile $logFile -Level INFO
     
-    $monitorEndPayload = @{
-        embeds = @(
+    if (-not $script:RbxSession.UserId) {
+        $script:RbxSession = Get-ActiveRobloxSessionDetails
+    }
+    $endPlayerDesc = if ($script:RbxSession.ProfileUrl -and $script:RbxSession.ProfileUrl -ne "N/A") {
+        "**Roblox User:** [$($script:RbxSession.Username)]($($script:RbxSession.ProfileUrl)) (ID: $($script:RbxSession.UserId))`n**PC:** $($env:USERNAME) on $env:COMPUTERNAME"
+    } else {
+        "**Player:** $($script:RbxSession.Username)`n**PC:** $($env:USERNAME) on $env:COMPUTERNAME"
+    }
+    $endEmbedObj = @{
+        title       = "Monitor Terminated"
+        description = $endPlayerDesc
+        color       = 3447003
+        fields      = @(
             @{
-                title = "Monitor Terminated"
-                description = "**Player:** $($script:RbxSession.Username)`n**PC:** $($env:USERNAME) on $env:COMPUTERNAME"
-                color = 3447003
-                fields = @(
-                    @{
-                        name = "Session Duration"
-                        value = "{0:hh\:mm\:ss}" -f $elapsed
-                        inline = $true
-                    },
-                    @{
-                        name = "Alert Totals"
-                        value = "Fails: $($script:MonitorAlertCounts.FAIL)`nWarnings: $($script:MonitorAlertCounts.WARN)"
-                        inline = $true
-                    }
-                )
-                timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                name   = "Session Duration"
+                value  = "{0:hh\:mm\:ss}" -f $elapsed
+                inline = $true
+            },
+            @{
+                name   = "Alert Totals"
+                value  = "Fails: $($script:MonitorAlertCounts.FAIL)`nWarnings: $($script:MonitorAlertCounts.WARN)"
+                inline = $true
             }
         )
+        timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
-    Send-DiscordWebhookPayload -Payload $monitorEndPayload
+    if ($script:RbxSession.AvatarUrl) {
+        $endEmbedObj['thumbnail'] = @{ url = $script:RbxSession.AvatarUrl }
+    }
+    Send-DiscordWebhookPayload -Payload @{ embeds = @($endEmbedObj) }
     Send-DiscordWebhookFile -FilePath $logFile -Comment "**[Live Monitor Log]** Complete match session event log for **$($script:RbxSession.Username)** on **$($env:COMPUTERNAME)**"
 
     Get-EventSubscriber -SourceIdentifier USBChange -ErrorAction SilentlyContinue |
