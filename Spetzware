@@ -207,9 +207,9 @@ function Write-MonitorAlert {
                 default { 3447003 }  # Cyan/Blue
             }
             $icon = switch ($Level) {
-                'FAIL' { '🚨' }
-                'WARN' { '⚠️' }
-                default { 'ℹ️' }
+                'FAIL' { 'ðŸš¨' }
+                'WARN' { 'âš ï¸' }
+                default { 'â„¹ï¸' }
             }
 
             $alertTitle = if ($acc.Username) { "[LIVE MATCH ALERT] $Level Detected - $($acc.Username)" } else { "[LIVE MATCH ALERT] $Level Detected" }
@@ -799,9 +799,9 @@ function Send-SpetzwareStep1Webhook {
 
         # Dispatch embed AND 1:1 .txt report file in a single multipart request
         $msgContent = if ($acc.Username) {
-            "👤 **Roblox Competitor: $rbxUserDisplay** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "ðŸ‘¤ **Roblox Competitor: $rbxUserDisplay** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         } else {
-            "💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         }
         Send-DiscordWebhookWithAttachment -Payload @{
             username = 'policy'
@@ -1020,9 +1020,9 @@ function Send-SpetzwareStep3Webhook {
 
         # Dispatch embed AND 1:1 .txt monitor log file in a single multipart request
         $msgContent3 = if ($acc.Username) {
-            "👤 **Roblox Competitor: $rbxUserDisplay3** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "ðŸ‘¤ **Roblox Competitor: $rbxUserDisplay3** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         } else {
-            "💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         }
         Send-DiscordWebhookWithAttachment -Payload @{
             username = 'policy'
@@ -1062,6 +1062,121 @@ function Send-SpetzwareStep3Webhook {
         Send-DiscordTextInChunks -Text $chatMonText
 
 
+    } catch {}
+}
+
+# ===================== Watchdog Sentinel Helpers =====================
+function Start-SpetzwareWatchdog {
+    if (-not $script:DiscordWebhookUrl) { return }
+    try {
+        $script:WatchdogCleanFlag = Join-Path $env:TEMP "spetzware_clean_exit_$PID.flag"
+        if (Test-Path -LiteralPath $script:WatchdogCleanFlag) {
+            Remove-Item -LiteralPath $script:WatchdogCleanFlag -Force -ErrorAction SilentlyContinue
+        }
+
+        $script:WatchdogStateFile = Join-Path $env:TEMP "spetzware_state_$PID.txt"
+        Set-Content -LiteralPath $script:WatchdogStateFile -Value "Step 1 (System Check)" -Force -ErrorAction SilentlyContinue
+
+        $script:WatchdogScriptPath = Join-Path $env:TEMP "spetzware_watchdog_$PID.ps1"
+
+        $accInfo = Get-SilentRobloxAccountInfo
+        $hwidVal = Get-MachineHwid
+        $startUtcStr = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+
+        $watchdogScriptLines = @(
+            '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12',
+            "`$TargetPid     = $PID",
+            "`$WebhookUrl    = '$($script:DiscordWebhookUrl)'",
+            "`$CleanFlag     = '$($script:WatchdogCleanFlag)'",
+            "`$StateFile     = '$($script:WatchdogStateFile)'",
+            "`$RbxUsername   = '$($accInfo.Username)'",
+            "`$RbxUserId     = '$($accInfo.UserId)'",
+            "`$RbxProfileUrl = '$($accInfo.ProfileUrl)'",
+            "`$RbxAvatarUrl  = '$($accInfo.AvatarUrl)'",
+            "`$MachineHwid   = '$hwidVal'",
+            "`$HostName      = '$env:COMPUTERNAME ($env:USERNAME)'",
+            "`$StartTimeUtc  = '$startUtcStr'",
+            "`$Version       = '$($script:SpetzwareVersion)'",
+            '',
+            'while ($true) {',
+            '    Start-Sleep -Seconds 1',
+            '    $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue',
+            '    if (-not $p) {',
+            '        if (Test-Path -LiteralPath $CleanFlag) {',
+            '            try { Remove-Item -LiteralPath $CleanFlag -Force -ErrorAction SilentlyContinue } catch {}',
+            '            try { Remove-Item -LiteralPath $StateFile -Force -ErrorAction SilentlyContinue } catch {}',
+            '            break',
+            '        }',
+            '        $currentStage = "System Check / Live Monitor"',
+            '        try {',
+            '            if (Test-Path -LiteralPath $StateFile) {',
+            '                $currentStage = (Get-Content -LiteralPath $StateFile -Raw -ErrorAction SilentlyContinue).Trim()',
+            '            }',
+            '        } catch {}',
+            '        $termUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")',
+            '        $valComp = if ($RbxUsername -and $RbxUserId) {',
+            '            "**Roblox User:** [**$RbxUsername**]($RbxProfileUrl) (ID: $RbxUserId)"',
+            '        } elseif ($RbxUsername) {',
+            '            "**Roblox User:** **$RbxUsername**"',
+            '        } else {',
+            '            "**Roblox User:** ``Unknown / Not Detected``"',
+            '        }',
+            '        $valMach = "**Host:** $HostName`n**HWID:** $MachineHwid"',
+            '        $valEvent = "Ã¢Å¡Â Ã¯Â¸Â **VIOLATION: Competitor closed or terminated the PowerShell window.**`n`n**Stage:** $currentStage`n**Method:** Window [X] closed, Alt+F4, or Process Terminated`n**Started:** $StartTimeUtc UTC`n**Closed:** $termUtc UTC"',
+            '        $embed = @{',
+            '            title = if ($RbxUsername) { "Ã°Å¸Å¡Â¨ [CONSOLE CLOSED] Process Terminated Abruptly - $RbxUsername" } else { "Ã°Å¸Å¡Â¨ [CONSOLE CLOSED] Process Terminated Abruptly" }',
+            '            color = 15158332',
+            '            fields = @(',
+            '                @{ name = "Competitor Information"; value = $valComp; inline = $true },',
+            '                @{ name = "Machine Fingerprint"; value = $valMach; inline = $true },',
+            '                @{ name = "Abrupt Termination Event"; value = $valEvent; inline = $false }',
+            '            )',
+            '            footer = @{ text = "Spetzware Automated Integrity Monitor v$Version" }',
+            '            timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")',
+            '        }',
+            '        if ($RbxAvatarUrl) { $embed.thumbnail = @{ url = $RbxAvatarUrl } }',
+            '        $payload = @{',
+            '            username = "policy"',
+            '            content = "Ã°Å¸Å¡Â¨ **ALERT: Competitor closed the PowerShell window without finishing the check!**"',
+            '            embeds = @($embed)',
+            '        }',
+            '        try {',
+            '            $json = $payload | ConvertTo-Json -Depth 5',
+            '            Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $json -ContentType "application/json; charset=utf-8" -TimeoutSec 10 | Out-Null',
+            '        } catch {}',
+            '        try { Remove-Item -LiteralPath $StateFile -Force -ErrorAction SilentlyContinue } catch {}',
+            '        break',
+            '    }',
+            '}',
+            'try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}'
+        )
+
+        [System.IO.File]::WriteAllLines($script:WatchdogScriptPath, $watchdogScriptLines, [System.Text.Encoding]::UTF8)
+        $script:WatchdogProcess = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$($script:WatchdogScriptPath)`"" -PassThru -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+function Set-SpetzwareWatchdogStage {
+    param([string]$Stage)
+    if ($script:WatchdogStateFile) {
+        try { Set-Content -LiteralPath $script:WatchdogStateFile -Value $Stage -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+function Stop-SpetzwareWatchdog {
+    try {
+        if ($script:WatchdogCleanFlag) {
+            New-Item -Path $script:WatchdogCleanFlag -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        if ($script:WatchdogProcess -and -not $script:WatchdogProcess.HasExited) {
+            Stop-Process -Id $script:WatchdogProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ($script:WatchdogScriptPath -and (Test-Path -LiteralPath $script:WatchdogScriptPath)) {
+            Remove-Item -LiteralPath $script:WatchdogScriptPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($script:WatchdogStateFile -and (Test-Path -LiteralPath $script:WatchdogStateFile)) {
+            Remove-Item -LiteralPath $script:WatchdogStateFile -Force -ErrorAction SilentlyContinue
+        }
     } catch {}
 }
 
@@ -1142,6 +1257,7 @@ function Add-RegistryKeyFingerprint {
 
 Write-Host ''
 Write-Host '  ==========================================' -ForegroundColor Cyan
+Start-SpetzwareWatchdog
 Write-Host '          Spetzware Recording Check         ' -ForegroundColor Cyan
 Write-Host '  ==========================================' -ForegroundColor Cyan
 Write-Host ''
@@ -4769,6 +4885,7 @@ function Write-StepHeader {
 }
 
 Write-StepHeader 'Step 1 of 3  -  System Check' -NoClear
+Set-SpetzwareWatchdogStage 'Step 1 (System Check)'
 Write-Host ''
 
 $script:ProgressWidth = 30
@@ -4907,6 +5024,7 @@ Write-Host "  Press Enter to continue to Step 2..." -ForegroundColor Yellow
 Read-Host | Out-Null
 
 Write-StepHeader 'Step 2 of 3  -  Process Explorer'
+Set-SpetzwareWatchdogStage 'Step 2 (Process Explorer)'
 Write-Host ''
 Write-Host '  Launching Process Explorer. Show the process list on the recording, then' -ForegroundColor Gray
 Write-Host '  CLOSE Process Explorer (File > Exit) to continue - this window waits for it.' -ForegroundColor Yellow
@@ -4931,6 +5049,7 @@ Write-Host "  Press Enter to start the live monitor..." -ForegroundColor Yellow
 Read-Host | Out-Null
 
 Write-StepHeader 'Step 3 of 3  -  Live Monitor'
+Set-SpetzwareWatchdogStage 'Step 3 (Live Monitor)'
 Write-Host ''
 Write-Host '  Keep this window open for the whole match and show it again afterwards.' -ForegroundColor Yellow
 Write-Host '  Quiet is normal: only suspicious activity is logged. Press Ctrl+C to stop.' -ForegroundColor DarkGray
@@ -5009,9 +5128,9 @@ try {
     $startTitle = if ($acc.Username) { "Spetzware - Step 3: Live Monitor Started ($($acc.Username))" } else { "Spetzware - Step 3: Live Monitor Started" }
     $startContent = if ($acc.Username) {
         $rbxStartDisplay = if ($acc.UserId) { "$($acc.Username) (ID: $($acc.UserId))" } else { $acc.Username }
-        "▶️ **Live Monitor Started - Roblox Competitor: $rbxStartDisplay** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        "â–¶ï¸ **Live Monitor Started - Roblox Competitor: $rbxStartDisplay** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
     } else {
-        "▶️ **Live Monitor Started** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        "â–¶ï¸ **Live Monitor Started** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
     }
     $startEmbed = @{
         title = $startTitle
@@ -5027,84 +5146,7 @@ try {
     Send-DiscordWebhookPayload -Payload @{ username = 'policy'; content = $startContent; embeds = @($startEmbed) }
 } catch {}
 
-# --- Watchdog Sentinel: Auto-detects if console window is closed prematurely ---
-$script:WatchdogCleanFlag = Join-Path $env:TEMP "spetzware_clean_exit_$PID.flag"
-try { Remove-Item -LiteralPath $script:WatchdogCleanFlag -Force -ErrorAction SilentlyContinue } catch {}
-
-$script:WatchdogScriptPath = Join-Path $env:TEMP "spetzware_watchdog_$PID.ps1"
-$script:WatchdogProcess = $null
-
-if ($script:DiscordWebhookUrl) {
-    try {
-        $accInfo = Get-SilentRobloxAccountInfo
-        $hwidVal = Get-MachineHwid
-        $startUtcStr = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
-
-        $watchdogBody = @"
-# Spetzware Sentinel Watchdog - Auto-dispatches if main console is closed abruptly
-`$TargetPid     = $PID
-`$WebhookUrl    = '$($script:DiscordWebhookUrl)'
-`$CleanFlag     = '$($script:WatchdogCleanFlag)'
-`$RbxUsername   = '$($accInfo.Username)'
-`$RbxUserId     = '$($accInfo.UserId)'
-`$RbxProfileUrl = '$($accInfo.ProfileUrl)'
-`$RbxAvatarUrl  = '$($accInfo.AvatarUrl)'
-`$MachineHwid   = '$hwidVal'
-`$HostName      = '$env:COMPUTERNAME ($env:USERNAME)'
-`$StartTimeUtc  = '$startUtcStr'
-`$Version       = '$($script:SpetzwareVersion)'
-
-while (`$true) {
-    Start-Sleep -Seconds 1
-    `$p = Get-Process -Id `$TargetPid -ErrorAction SilentlyContinue
-    if (-not `$p) {
-        if (Test-Path -LiteralPath `$CleanFlag) {
-            try { Remove-Item -LiteralPath `$CleanFlag -Force -ErrorAction SilentlyContinue } catch {}
-            break
-        }
-
-        `$termUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
-        `$valComp = if (`$RbxUsername -and `$RbxUserId) {
-            "**Roblox User:** [**`$RbxUsername**](`$RbxProfileUrl) (ID: `$RbxUserId)"
-        } elseif (`$RbxUsername) {
-            "**Roblox User:** **`$RbxUsername**"
-        } else {
-            '**Roblox User:** `Unknown / Not Detected`'
-        }
-        `$valMach = "**Host:** `$HostName``n**HWID:** `$MachineHwid"
-        `$valEvent = "âš ï¸ **VIOLATION: Competitor closed or terminated the PowerShell window during live monitoring.**``n``n**Method:** Window [X] closed, Alt+F4, or Process Killed``n**Started:** `$StartTimeUtc UTC``n**Closed:** `$termUtc UTC"
-
-        `$embed = @{
-            title = if (`$RbxUsername) { "ðŸš¨ [CONSOLE CLOSED] Live Monitor Terminated Abruptly - `$RbxUsername" } else { "ðŸš¨ [CONSOLE CLOSED] Live Monitor Terminated Abruptly" }
-            color = 15158332
-            fields = @(
-                @{ name = 'Competitor Information'; value = `$valComp; inline = $true },
-                @{ name = 'Machine Fingerprint'; value = `$valMach; inline = $true },
-                @{ name = 'Abrupt Termination Event'; value = `$valEvent; inline = $false }
-            )
-            footer = @{ text = "Spetzware Automated Integrity Monitor v`$Version" }
-            timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        }
-        if (`$RbxAvatarUrl) { `$embed.thumbnail = @{ url = `$RbxAvatarUrl } }
-
-        `$payload = @{
-            username = 'policy'
-            content = "ðŸš¨ **ALERT: Live monitor was forcibly closed without completing!**"
-            embeds = @(`$embed)
-        }
-        try {
-            `$json = `$payload | ConvertTo-Json -Depth 5
-            Invoke-RestMethod -Uri `$WebhookUrl -Method Post -Body `$json -ContentType 'application/json; charset=utf-8' -TimeoutSec 10 | Out-Null
-        } catch {}
-        break
-    }
-}
-try { Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
-"@
-        [System.IO.File]::WriteAllText($script:WatchdogScriptPath, $watchdogBody, [System.Text.Encoding]::UTF8)
-        $script:WatchdogProcess = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$($script:WatchdogScriptPath)`"" -PassThru -ErrorAction SilentlyContinue
-    } catch {}
-}
+# Watchdog sentinel is managed globally via Start/Set/Stop-SpetzwareWatchdog
 
 $folderScanCounter = 0
 $deletionScanCounter = 0
@@ -5402,6 +5444,10 @@ while ($true) {
                 if ($line -like 'SUCCESS*' -or $line -like 'INFO*') { continue }
                 Write-MonitorAlertOnce -Category 'pshost' -Message $line -LogFile $logFile
             }
+            foreach ($line in (Get-NtdllSyscallIntegrityAlerts)) {
+                if ($line -like 'SUCCESS*' -or $line -like 'INFO*') { continue }
+                Write-MonitorAlertOnce -Category 'pshost' -Message $line -LogFile $logFile
+            }
         } catch {
             Write-MonitorAlertOnce -Category 'error' -Message "WARNING: Integrity tracking failed ($($_.Exception.Message))" -LogFile $logFile
         }
@@ -5414,16 +5460,7 @@ while ($true) {
     }
 }
 } finally {
-    # Signal clean exit to watchdog and terminate watchdog
-    if ($script:WatchdogCleanFlag) {
-        try { New-Item -Path $script:WatchdogCleanFlag -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
-    }
-    if ($script:WatchdogProcess -and -not $script:WatchdogProcess.HasExited) {
-        try { Stop-Process -Id $script:WatchdogProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
-    }
-    if ($script:WatchdogScriptPath -and (Test-Path -LiteralPath $script:WatchdogScriptPath)) {
-        try { Remove-Item -LiteralPath $script:WatchdogScriptPath -Force -ErrorAction SilentlyContinue } catch {}
-    }
+    Stop-SpetzwareWatchdog
 
     Clear-MonitorStatusLine
     $elapsed = (Get-Date) - $monitoringStart
