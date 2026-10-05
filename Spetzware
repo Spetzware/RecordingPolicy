@@ -4480,12 +4480,20 @@ function Get-PowerShellHostIntegrityAlerts {
         foreach ($k in $gdp.Keys) { $alerts += "WARNING: Global default parameter set -> $k = $($gdp[$k])" }
     }
 
+    $knownDefaultScriptMembers = @{
+        'System.Diagnostics.Process' = @('Path', 'Company', 'CPU', 'FileVersion', 'ProductVersion', 'Description', 'Product')
+        'System.IO.FileInfo'         = @('VersionInfo', 'BaseName')
+    }
+
     foreach ($t in 'System.Management.Automation.Signature', 'System.Diagnostics.Process', 'System.IO.FileInfo', 'Microsoft.Management.Infrastructure.CimInstance') {
         try {
             $td = Microsoft.PowerShell.Utility\Get-TypeData -TypeName $t -ErrorAction Stop
             if (-not $td) { continue }
+            $known = $knownDefaultScriptMembers[$t]
+            if ($null -eq $known) { $known = @() }
             foreach ($m in $td.Members.Values) {
                 if ($m -is [System.Management.Automation.Runspaces.ScriptPropertyData] -or $m -is [System.Management.Automation.Runspaces.ScriptMethodData]) {
+                    if ($known -contains $m.Name) { continue }
                     $alerts += "FAILURE: Script override on $t -> '$($m.Name)'"
                 }
             }
