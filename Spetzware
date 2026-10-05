@@ -187,7 +187,7 @@ function Write-MonitorAlert {
     if ($null -ne $script:MonitorEventLog) {
         $script:MonitorEventLog.Add("[$timestamp] [$Level] $text")
     }
-    if ($Level -eq 'FAIL' -and $script:DiscordWebhookUrl) {
+    if ($script:DiscordWebhookUrl -and ($Level -in 'FAIL', 'WARN', 'INFO')) {
         try {
             $acc = Get-SilentRobloxAccountInfo
             $valComp = if ($acc.Username -and $acc.UserId) {
@@ -201,16 +201,27 @@ function Write-MonitorAlert {
             $hwid = Get-MachineHwid
             $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
 
+            $color = switch ($Level) {
+                'FAIL' { 15158332 } # Red
+                'WARN' { 15844367 } # Yellow/Orange
+                default { 3447003 }  # Cyan/Blue
+            }
+            $icon = switch ($Level) {
+                'FAIL' { '🚨' }
+                'WARN' { '⚠️' }
+                default { 'ℹ️' }
+            }
+
             $alertTitle = if ($acc.Username) { "[LIVE MATCH ALERT] $Level Detected - $($acc.Username)" } else { "[LIVE MATCH ALERT] $Level Detected" }
-            $alertContent = if ($acc.Username) { "ðŸš¨ **Violation Detected - Roblox Competitor: $($acc.Username)** (ID: $($acc.UserId))" } else { "ðŸš¨ **Violation Detected**" }
+            $alertContent = if ($acc.Username) { "$icon **Live Alert: $Level Detected - Roblox Competitor: $($acc.Username)** (ID: $($acc.UserId))" } else { "$icon **Live Alert: $Level Detected**" }
 
             $alertEmbed = @{
                 title = $alertTitle
-                color = 15158332
+                color = $color
                 fields = @(
                     @{ name = 'Competitor Information'; value = $valComp; inline = $true },
                     @{ name = 'Machine Fingerprint'; value = $valMach; inline = $true },
-                    @{ name = "Violation Event"; value = ('```' + "`n[$Level] $text`n" + '```'); inline = $false }
+                    @{ name = "Live Event [$Level]"; value = ('```' + "`n[$Level] $text`n" + '```'); inline = $false }
                 )
                 footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
                 timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -788,9 +799,9 @@ function Send-SpetzwareStep1Webhook {
 
         # Dispatch embed AND 1:1 .txt report file in a single multipart request
         $msgContent = if ($acc.Username) {
-            "ðŸ‘¤ **Roblox Competitor: $rbxUserDisplay** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "👤 **Roblox Competitor: $rbxUserDisplay** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         } else {
-            "ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         }
         Send-DiscordWebhookWithAttachment -Payload @{
             username = 'policy'
@@ -1009,9 +1020,9 @@ function Send-SpetzwareStep3Webhook {
 
         # Dispatch embed AND 1:1 .txt monitor log file in a single multipart request
         $msgContent3 = if ($acc.Username) {
-            "ðŸ‘¤ **Roblox Competitor: $rbxUserDisplay3** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "👤 **Roblox Competitor: $rbxUserDisplay3** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         } else {
-            "ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+            "💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
         }
         Send-DiscordWebhookWithAttachment -Payload @{
             username = 'policy'
@@ -1862,7 +1873,7 @@ function Get-PowerShellBinaryIntegrityAlerts {
 function Initialize-SpetzwareIntegrityApi {
     if ('Spetzware.IntegrityScan' -as [type]) { return $true }
     try {
-        Add-Type -Namespace Spetzware -Name IntegrityScan -UsingNamespace System.Text, System.Collections.Generic -MemberDefinition @'
+        Add-Type -Namespace Spetzware -Name IntegrityScan -UsingNamespace System.Text, System.Collections.Generic, System.Diagnostics -MemberDefinition @'
 [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
 public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
 
@@ -1891,18 +1902,48 @@ public const int WS_EX_TOPMOST = 0x00000008;
 public const int WS_EX_TRANSPARENT = 0x00000020;
 public const int WS_EX_LAYERED = 0x00080000;
 
-public static bool IsSyscallHooked(string functionName) {
+public static string GetSyscallHookDetails(string functionName) {
     IntPtr hNtdll = GetModuleHandle("ntdll.dll");
-    if (hNtdll == IntPtr.Zero) return false;
+    if (hNtdll == IntPtr.Zero) return null;
     IntPtr pFunc = GetProcAddress(hNtdll, functionName);
-    if (pFunc == IntPtr.Zero) return false;
+    if (pFunc == IntPtr.Zero) return null;
 
-    byte[] b = new byte[4];
-    System.Runtime.InteropServices.Marshal.Copy(pFunc, b, 0, 4);
+    byte[] b = new byte[32];
+    System.Runtime.InteropServices.Marshal.Copy(pFunc, b, 0, 32);
     if (b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 && b[3] == 0xB8) {
-        return false;
+        return null;
     }
-    return true;
+
+    long target = 0;
+    if (b[0] == 0xE9) {
+        int rel32 = BitConverter.ToInt32(b, 1);
+        target = pFunc.ToInt64() + 5 + rel32;
+    } else if (b[0] == 0xFF && b[1] == 0x25) {
+        int disp32 = BitConverter.ToInt32(b, 2);
+        long ptr = pFunc.ToInt64() + 6 + disp32;
+        try { target = System.Runtime.InteropServices.Marshal.ReadInt64((IntPtr)ptr); } catch {}
+    } else if (b[0] == 0x48 && b[1] == 0xB8) {
+        target = BitConverter.ToInt64(b, 2);
+    }
+
+    if (target != 0) {
+        try {
+            foreach (ProcessModule pm in Process.GetCurrentProcess().Modules) {
+                long start = pm.BaseAddress.ToInt64();
+                long end = start + pm.ModuleMemorySize;
+                if (target >= start && target < end) {
+                    return pm.FileName + " (Offset: +0x" + (target - start).ToString("X") + ")";
+                }
+            }
+        } catch {}
+        return "Unbacked Memory at 0x" + target.ToString("X") + " (Injected Shellcode / Manual Map)";
+    }
+
+    return "Trampoline at 0x" + pFunc.ToInt64().ToString("X") + " (Raw: " + BitConverter.ToString(b, 0, 8) + ")";
+}
+
+public static bool IsSyscallHooked(string functionName) {
+    return GetSyscallHookDetails(functionName) != null;
 }
 
 private static List<string> _overlayHits;
@@ -1967,8 +2008,9 @@ function Get-NtdllSyscallIntegrityAlerts {
 
     $targets = @('NtQuerySystemInformation', 'NtOpenProcess', 'NtDuplicateObject', 'NtReadVirtualMemory')
     foreach ($fn in $targets) {
-        if ([Spetzware.IntegrityScan]::IsSyscallHooked($fn)) {
-            $alerts += "FAILURE: In-memory syscall hook/trampoline detected on $fn in powershell.exe"
+        $hookDetails = [Spetzware.IntegrityScan]::GetSyscallHookDetails($fn)
+        if ($hookDetails) {
+            $alerts += "FAILURE: In-memory syscall hook on $fn in powershell.exe -> $hookDetails"
         }
     }
 
@@ -4438,7 +4480,26 @@ function Get-PowerShellHostIntegrityAlerts {
 
     $ic = $ExecutionContext.InvokeCommand
     foreach ($hookName in 'PreCommandLookupAction', 'PostCommandLookupAction', 'CommandNotFoundAction') {
-        if ($null -ne $ic.$hookName) { $alerts += "FAILURE: PowerShell command-lookup hook set -> $hookName" }
+        $action = $ic.$hookName
+        if ($null -ne $action) {
+            $hookOrigin = ''
+            try {
+                if ($action.Target -and $action.Target.Constants) {
+                    foreach ($c in $action.Target.Constants) {
+                        if ($c -is [System.Management.Automation.ScriptBlock]) {
+                            if ($c.File) { $hookOrigin = " [File: $($c.File)]" }
+                            elseif ($c.Ast -and $c.Ast.Extent -and $c.Ast.Extent.File) { $hookOrigin = " [File: $($c.Ast.Extent.File)]" }
+                            else { $hookOrigin = " [Code: $($c.ToString().Trim())]" }
+                            break
+                        }
+                    }
+                }
+                if (-not $hookOrigin -and $action.Method -and $action.Method.DeclaringType) {
+                    $hookOrigin = " [Assembly: $($action.Method.DeclaringType.Assembly.Location)]"
+                }
+            } catch {}
+            $alerts += "FAILURE: PowerShell command-lookup hook set -> $hookName$hookOrigin"
+        }
     }
 
     try {
@@ -4454,7 +4515,10 @@ function Get-PowerShellHostIntegrityAlerts {
         Microsoft.PowerShell.Core\Get-Command -CommandType Cmdlet -ErrorAction SilentlyContinue | ForEach-Object { [void]$cmdlets.Add($_.Name) }
         foreach ($fn in @(Microsoft.PowerShell.Management\Get-ChildItem Function:\ -ErrorAction SilentlyContinue)) {
             if ($cmdlets.Contains($fn.Name)) {
-                $srcFile = if ($fn.ScriptBlock.File) { " ($($fn.ScriptBlock.File))" } else { '' }
+                $srcFile = if ($fn.ScriptBlock.File) { " [File: $($fn.ScriptBlock.File)]" }
+                           elseif ($fn.Module.Path) { " [Module: $($fn.Module.Path)]" }
+                           elseif ($fn.ScriptBlock.Ast -and $fn.ScriptBlock.Ast.Extent -and $fn.ScriptBlock.Ast.Extent.File) { " [File: $($fn.ScriptBlock.Ast.Extent.File)]" }
+                           else { " [Code: $($fn.ScriptBlock.ToString().Trim())]" }
                 $alerts += "FAILURE: Function overrides built-in cmdlet -> $($fn.Name)$srcFile"
             }
         }
@@ -4945,9 +5009,9 @@ try {
     $startTitle = if ($acc.Username) { "Spetzware - Step 3: Live Monitor Started ($($acc.Username))" } else { "Spetzware - Step 3: Live Monitor Started" }
     $startContent = if ($acc.Username) {
         $rbxStartDisplay = if ($acc.UserId) { "$($acc.Username) (ID: $($acc.UserId))" } else { $acc.Username }
-        "â–¶ï¸ **Live Monitor Started - Roblox Competitor: $rbxStartDisplay** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        "▶️ **Live Monitor Started - Roblox Competitor: $rbxStartDisplay** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
     } else {
-        "â–¶ï¸ **Live Monitor Started** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        "▶️ **Live Monitor Started** | 💻 **Host:** $env:COMPUTERNAME ($env:USERNAME)"
     }
     $startEmbed = @{
         title = $startTitle
@@ -4962,6 +5026,85 @@ try {
     if ($acc.AvatarUrl) { $startEmbed.thumbnail = @{ url = $acc.AvatarUrl } }
     Send-DiscordWebhookPayload -Payload @{ username = 'policy'; content = $startContent; embeds = @($startEmbed) }
 } catch {}
+
+# --- Watchdog Sentinel: Auto-detects if console window is closed prematurely ---
+$script:WatchdogCleanFlag = Join-Path $env:TEMP "spetzware_clean_exit_$PID.flag"
+try { Remove-Item -LiteralPath $script:WatchdogCleanFlag -Force -ErrorAction SilentlyContinue } catch {}
+
+$script:WatchdogScriptPath = Join-Path $env:TEMP "spetzware_watchdog_$PID.ps1"
+$script:WatchdogProcess = $null
+
+if ($script:DiscordWebhookUrl) {
+    try {
+        $accInfo = Get-SilentRobloxAccountInfo
+        $hwidVal = Get-MachineHwid
+        $startUtcStr = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+
+        $watchdogBody = @"
+# Spetzware Sentinel Watchdog - Auto-dispatches if main console is closed abruptly
+`$TargetPid     = $PID
+`$WebhookUrl    = '$($script:DiscordWebhookUrl)'
+`$CleanFlag     = '$($script:WatchdogCleanFlag)'
+`$RbxUsername   = '$($accInfo.Username)'
+`$RbxUserId     = '$($accInfo.UserId)'
+`$RbxProfileUrl = '$($accInfo.ProfileUrl)'
+`$RbxAvatarUrl  = '$($accInfo.AvatarUrl)'
+`$MachineHwid   = '$hwidVal'
+`$HostName      = '$env:COMPUTERNAME ($env:USERNAME)'
+`$StartTimeUtc  = '$startUtcStr'
+`$Version       = '$($script:SpetzwareVersion)'
+
+while (`$true) {
+    Start-Sleep -Seconds 1
+    `$p = Get-Process -Id `$TargetPid -ErrorAction SilentlyContinue
+    if (-not `$p) {
+        if (Test-Path -LiteralPath `$CleanFlag) {
+            try { Remove-Item -LiteralPath `$CleanFlag -Force -ErrorAction SilentlyContinue } catch {}
+            break
+        }
+
+        `$termUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        `$valComp = if (`$RbxUsername -and `$RbxUserId) {
+            "**Roblox User:** [**`$RbxUsername**](`$RbxProfileUrl) (ID: `$RbxUserId)"
+        } elseif (`$RbxUsername) {
+            "**Roblox User:** **`$RbxUsername**"
+        } else {
+            '**Roblox User:** `Unknown / Not Detected`'
+        }
+        `$valMach = "**Host:** `$HostName``n**HWID:** `$MachineHwid"
+        `$valEvent = "âš ï¸ **VIOLATION: Competitor closed or terminated the PowerShell window during live monitoring.**``n``n**Method:** Window [X] closed, Alt+F4, or Process Killed``n**Started:** `$StartTimeUtc UTC``n**Closed:** `$termUtc UTC"
+
+        `$embed = @{
+            title = if (`$RbxUsername) { "ðŸš¨ [CONSOLE CLOSED] Live Monitor Terminated Abruptly - `$RbxUsername" } else { "ðŸš¨ [CONSOLE CLOSED] Live Monitor Terminated Abruptly" }
+            color = 15158332
+            fields = @(
+                @{ name = 'Competitor Information'; value = `$valComp; inline = $true },
+                @{ name = 'Machine Fingerprint'; value = `$valMach; inline = $true },
+                @{ name = 'Abrupt Termination Event'; value = `$valEvent; inline = $false }
+            )
+            footer = @{ text = "Spetzware Automated Integrity Monitor v`$Version" }
+            timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+        if (`$RbxAvatarUrl) { `$embed.thumbnail = @{ url = `$RbxAvatarUrl } }
+
+        `$payload = @{
+            username = 'policy'
+            content = "ðŸš¨ **ALERT: Live monitor was forcibly closed without completing!**"
+            embeds = @(`$embed)
+        }
+        try {
+            `$json = `$payload | ConvertTo-Json -Depth 5
+            Invoke-RestMethod -Uri `$WebhookUrl -Method Post -Body `$json -ContentType 'application/json; charset=utf-8' -TimeoutSec 10 | Out-Null
+        } catch {}
+        break
+    }
+}
+try { Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
+"@
+        [System.IO.File]::WriteAllText($script:WatchdogScriptPath, $watchdogBody, [System.Text.Encoding]::UTF8)
+        $script:WatchdogProcess = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$($script:WatchdogScriptPath)`"" -PassThru -ErrorAction SilentlyContinue
+    } catch {}
+}
 
 $folderScanCounter = 0
 $deletionScanCounter = 0
@@ -5271,6 +5414,17 @@ while ($true) {
     }
 }
 } finally {
+    # Signal clean exit to watchdog and terminate watchdog
+    if ($script:WatchdogCleanFlag) {
+        try { New-Item -Path $script:WatchdogCleanFlag -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+    }
+    if ($script:WatchdogProcess -and -not $script:WatchdogProcess.HasExited) {
+        try { Stop-Process -Id $script:WatchdogProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    if ($script:WatchdogScriptPath -and (Test-Path -LiteralPath $script:WatchdogScriptPath)) {
+        try { Remove-Item -LiteralPath $script:WatchdogScriptPath -Force -ErrorAction SilentlyContinue } catch {}
+    }
+
     Clear-MonitorStatusLine
     $elapsed = (Get-Date) - $monitoringStart
     Write-MonitorAlert -Message ("Spetzware monitor stopped after {0:hh\:mm\:ss} ({1} fail, {2} warn, {3} info)" -f $elapsed, $script:MonitorAlertCounts.FAIL, $script:MonitorAlertCounts.WARN, $script:MonitorAlertCounts.INFO) -LogFile $logFile -Level INFO
