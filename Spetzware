@@ -201,8 +201,11 @@ function Write-MonitorAlert {
             $hwid = Get-MachineHwid
             $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
 
+            $alertTitle = if ($acc.Username) { "[LIVE MATCH ALERT] $Level Detected - $($acc.Username)" } else { "[LIVE MATCH ALERT] $Level Detected" }
+            $alertContent = if ($acc.Username) { "ðŸš¨ **Violation Detected - Roblox Competitor: $($acc.Username)** (ID: $($acc.UserId))" } else { "ðŸš¨ **Violation Detected**" }
+
             $alertEmbed = @{
-                title = "[LIVE MATCH ALERT] $Level Detected"
+                title = $alertTitle
                 color = 15158332
                 fields = @(
                     @{ name = 'Competitor Information'; value = $valComp; inline = $true },
@@ -213,7 +216,7 @@ function Write-MonitorAlert {
                 timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             }
             if ($acc.AvatarUrl) { $alertEmbed.thumbnail = @{ url = $acc.AvatarUrl } }
-            Send-DiscordWebhookPayload -Payload @{ username = 'policy'; embeds = @($alertEmbed) }
+            Send-DiscordWebhookPayload -Payload @{ username = 'policy'; content = $alertContent; embeds = @($alertEmbed) }
         } catch {}
     }
 }
@@ -406,33 +409,143 @@ function Send-DiscordWebhookPayload {
     }
 }
 
+function Send-DiscordWebhookWithAttachment {
+    param(
+        [hashtable]$Payload,
+        [string]$FilePath,
+        [string]$FileName = ''
+    )
+    if (-not $script:DiscordWebhookUrl) { return }
+    if (-not (Test-Path -LiteralPath $FilePath)) {
+        Send-DiscordWebhookPayload -Payload $Payload
+        return
+    }
+
+    if (-not $FileName) { $FileName = [System.IO.Path]::GetFileName($FilePath) }
+    $json = $Payload | ConvertTo-Json -Depth 10
+    $sent = $false
+
+    # Strategy 1: Native curl.exe (standard on Windows 10/11)
+    $curlPath = $null
+    try {
+        $curlCmd = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
+        if ($curlCmd) { $curlPath = $curlCmd.Source }
+    } catch {}
+    if (-not $curlPath -and (Test-Path "$env:SystemRoot\System32\curl.exe")) {
+        $curlPath = "$env:SystemRoot\System32\curl.exe"
+    }
+
+    if ($curlPath) {
+        $tempJson = [System.IO.Path]::GetTempFileName()
+        try {
+            [System.IO.File]::WriteAllText($tempJson, $json, [System.Text.Encoding]::UTF8)
+            for ($attempt = 0; $attempt -lt 3 -and -not $sent; $attempt++) {
+                try {
+                    $curlArgs = @(
+                        '-s', '-X', 'POST',
+                        '-F', "payload_json=<$tempJson;type=application/json",
+                        '-F', "files[0]=@$FilePath;filename=$FileName",
+                        $script:DiscordWebhookUrl
+                    )
+                    $resp = & $curlPath @curlArgs
+                    if ($resp -match '"id"\s*:' -or $resp -match '"attachments"\s*:') {
+                        $sent = $true
+                    } elseif ($resp -match '429' -or $resp -match 'retry_after') {
+                        Start-Sleep -Milliseconds 1500
+                    }
+                } catch {
+                    Start-Sleep -Milliseconds 1000
+                }
+            }
+        } finally {
+            try { Remove-Item -LiteralPath $tempJson -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+
+    # Strategy 2: Pure .NET HttpWebRequest multipart/form-data fallback
+    if (-not $sent) {
+        for ($attempt = 0; $attempt -lt 3 -and -not $sent; $attempt++) {
+            try {
+                $boundary = "----SpetzwareBoundary" + [System.Guid]::NewGuid().ToString("N")
+                $req = [System.Net.HttpWebRequest]::Create($script:DiscordWebhookUrl)
+                $req.Method = 'POST'
+                $req.ContentType = "multipart/form-data; boundary=$boundary"
+                $req.Timeout = 15000
+
+                $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
+                $encoding = [System.Text.Encoding]::UTF8
+                $mem = New-Object System.IO.MemoryStream
+
+                $part1 = "--$boundary`r`nContent-Disposition: form-data; name=`"payload_json`"`r`nContent-Type: application/json; charset=utf-8`r`n`r`n$json`r`n"
+                $part2 = "--$boundary`r`nContent-Disposition: form-data; name=`"files[0]`"; filename=`"$FileName`"`r`nContent-Type: text/plain; charset=utf-8`r`n`r`n"
+                $part3 = "`r`n--$boundary--`r`n"
+
+                $b1 = $encoding.GetBytes($part1)
+                $b2 = $encoding.GetBytes($part2)
+                $b3 = $encoding.GetBytes($part3)
+
+                $mem.Write($b1, 0, $b1.Length)
+                $mem.Write($b2, 0, $b2.Length)
+                $mem.Write($fileBytes, 0, $fileBytes.Length)
+                $mem.Write($b3, 0, $b3.Length)
+
+                $allBytes = $mem.ToArray()
+                $req.ContentLength = $allBytes.Length
+                $reqStream = $req.GetRequestStream()
+                $reqStream.Write($allBytes, 0, $allBytes.Length)
+                $reqStream.Flush()
+                $reqStream.Close()
+
+                $resp = $req.GetResponse()
+                $resp.Close()
+                $sent = $true
+            } catch {
+                $status = 0
+                try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+                if ($status -eq 429) {
+                    Start-Sleep -Milliseconds 1500
+                    continue
+                }
+                break
+            }
+        }
+    }
+
+    # Strategy 3: Embed-only fallback
+    if (-not $sent) {
+        Send-DiscordWebhookPayload -Payload $Payload
+    }
+}
+
 function Send-DiscordTextInChunks {
     param([string]$Text)
     if (-not $Text) { return }
     $lines = $Text -split "`r?`n"
     $currentChunk = ''
     foreach ($line in $lines) {
-        if (($currentChunk.Length + $line.Length + 10) -gt 1900) {
+        $candidate = if ($currentChunk) { "$currentChunk`r`n$line" } else { $line }
+        if (($candidate.Length + 12) -gt 1900) {
             if ($currentChunk.Trim()) {
                 Send-DiscordWebhookPayload -Payload @{
-                    username = 'Spetzware Security'
+                    username = 'policy'
                     content = '```' + "`n$currentChunk`n" + '```'
                 }
                 Start-Sleep -Milliseconds 600
             }
-            $currentChunk = "$line`n"
+            $currentChunk = $line
         } else {
-            $currentChunk += "$line`n"
+            $currentChunk = $candidate
         }
     }
     if ($currentChunk.Trim()) {
         Send-DiscordWebhookPayload -Payload @{
-            username = 'Spetzware Security'
+            username = 'policy'
             content = '```' + "`n$currentChunk`n" + '```'
         }
         Start-Sleep -Milliseconds 600
     }
 }
+
 
 function Format-AnsiSummaryBlock {
     param([array]$SectionResults)
@@ -536,8 +649,71 @@ function Send-SpetzwareStep1Webhook {
             }
         }
 
+        # Format flagged violations/warnings for the embed highlight card
+        $flaggedBlocks = @()
+        foreach ($r in $Results) {
+            if ($r.Summary.Status -eq 'FAIL' -or $r.Summary.Status -eq 'WARN') {
+                $secLines = @()
+                $secLines += "$($r.Name) [$($r.Summary.Status)]"
+                foreach ($l in @($r.Lines)) {
+                    $tag = 'NOTE'; $t = $l
+                    if ($l -match '^(SUCCESS|FAILURE|WARNING|INFO):\s*(.*)$') {
+                        $t = $matches[2]
+                        switch ($matches[1]) {
+                            'SUCCESS' { $tag = 'PASS' }
+                            'FAILURE' { $tag = 'FAIL' }
+                            'WARNING' { $tag = 'WARN' }
+                            'INFO'    { $tag = 'INFO' }
+                        }
+                    }
+                    if ($tag -eq 'FAIL') {
+                        $secLines += "- [$tag] $t"
+                    } elseif ($tag -eq 'WARN') {
+                        $secLines += "! [$tag] $t"
+                    }
+                }
+                $flaggedBlocks += ($secLines -join "`n")
+            }
+        }
+
+        $guid = [guid]::NewGuid().ToString('N')
+        $reportFileName = "spetzware_system_check_$guid.txt"
+
+        if ($flaggedBlocks.Count -gt 0) {
+            $joinedFlags = $flaggedBlocks -join "`n`n"
+            if ($joinedFlags.Length -gt 950) {
+                $joinedFlags = $joinedFlags.Substring(0, 900) + "`n... (see full details below and in attached $reportFileName)"
+            }
+            $embedFields += @{
+                name = '--- DETAILS ---'
+                value = '```diff' + "`n$joinedFlags`n" + '```'
+                inline = $false
+            }
+        } else {
+            $embedFields += @{
+                name = '--- DETAILS ---'
+                value = '```diff' + "`n+ All checks clean. Zero violations or warnings detected.`n" + '```'
+                inline = $false
+            }
+        }
+
+        $utcTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        $rbxUserDisplay = if ($acc.Username -and $acc.UserId) {
+            "$($acc.Username) (ID: $($acc.UserId))"
+        } elseif ($acc.Username) {
+            $acc.Username
+        } else {
+            "Not Detected"
+        }
+        $rbxPlaceDisplay = if ($acc.ActivePlace) {
+            "$($acc.ActivePlace) (https://www.roblox.com/games/$($acc.ActivePlace))"
+        } else {
+            "None / Not In Game"
+        }
+
+        $embedTitle = if ($acc.Username) { "Spetzware - Step 1 Results ($($acc.Username))" } else { "Spetzware - Step 1 Results" }
         $embed = @{
-            title = 'Spetzware - Step 1 Results'
+            title = $embedTitle
             color = $color
             fields = $embedFields
             footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
@@ -547,22 +723,44 @@ function Send-SpetzwareStep1Webhook {
             $embed.thumbnail = @{ url = $acc.AvatarUrl }
         }
 
-        Send-DiscordWebhookPayload -Payload @{
-            username = 'policy'
-            embeds = @($embed)
-        }
-        Start-Sleep -Milliseconds 600
+        # Build complete 1:1 Step 1 Report .txt file exactly matching spetzware_system_check_26d65656ed434beca1c31889c18d5872.txt
+        $reportTempPath = Join-Path $env:TEMP $reportFileName
+        $downloadsDir = Join-Path $env:USERPROFILE 'Downloads'
+        $reportDownloadsPath = if (Test-Path -LiteralPath $downloadsDir) { Join-Path $downloadsDir $reportFileName } else { $null }
 
-        # Detailed 1:1 Report in Clean Codeblocks
         $reportLines = @()
-        $reportLines += "========================================================================"
-        $reportLines += "  Spetzware v$($script:SpetzwareVersion)   Step 1 of 3 - System Check Details"
-        $reportLines += "------------------------------------------------------------------------"
-        $hasDetails = $false
+        $reportLines += "================================================================================"
+        $reportLines += "            Spetzware v$($script:SpetzwareVersion) - Step 1 System Check"
+        $reportLines += "================================================================================"
+        $reportLines += "Timestamp:    $utcTime UTC"
+        $reportLines += "Host:         $env:COMPUTERNAME ($env:USERNAME)"
+        $reportLines += "Machine HWID: $hwid"
+        $reportLines += "Roblox User:  $rbxUserDisplay"
+        $reportLines += "Active Place: $rbxPlaceDisplay"
+        $reportLines += "Summary:      $SuccessRate% Pass Rate ($PassCount/$CheckTotal Clean, $FailCount Fail, $WarnCount Warn)"
+        $reportLines += "================================================================================"
+        $reportLines += ""
+        $reportLines += "--- SUMMARY ---"
+        $reportLines += "--------------------------------------------------------------------------------"
+        foreach ($r in $Results) {
+            $s = $r.Summary
+            $counts = @()
+            if ($s.Fail -gt 0) { $counts += "$($s.Fail) fail" }
+            if ($s.Warn -gt 0) { $counts += "$($s.Warn) warn" }
+            if ($s.Info -gt 0) { $counts += "$($s.Info) info" }
+            $countText = ''
+            if ($counts.Count -gt 0) { $countText = '  (' + ($counts -join ', ') + ')' }
+            $namePad = ('{0,-33}' -f $r.Name)
+            $reportLines += "$namePad [$($s.Status)]$countText"
+        }
+        $reportLines += "--------------------------------------------------------------------------------"
+        $reportLines += ""
+        $reportLines += "--- DETAILS ---"
+        $reportLines += "--------------------------------------------------------------------------------"
+        $reportLines += ""
         foreach ($r in $Results) {
             if ($r.Summary.Status -eq 'PASS' -and $r.Summary.Info -eq 0) { continue }
-            $hasDetails = $true
-            $reportLines += "  $($r.Name) [$($r.Summary.Status)]"
+            $reportLines += "$($r.Name) [$($r.Summary.Status)]"
             foreach ($l in @($r.Lines)) {
                 $tag = 'NOTE'; $t = $l
                 if ($l -match '^(SUCCESS|FAILURE|WARNING|INFO):\s*(.*)$') {
@@ -574,16 +772,74 @@ function Send-SpetzwareStep1Webhook {
                         'INFO'    { $tag = 'INFO' }
                     }
                 }
-                $reportLines += "    [$tag] $t"
+                $reportLines += "  [$tag] $t"
             }
+            $reportLines += ""
         }
-        if (-not $hasDetails) {
-            $reportLines += "  All $CheckTotal sections clean. No warnings or violations found."
-        }
-        $reportLines += "========================================================================"
+        $reportLines += "================================================================================"
+        $reportLines += "End of Step 1 System Check"
+        $reportLines += "================================================================================"
 
-        $full1to1Text = $reportLines -join "`n"
-        Send-DiscordTextInChunks -Text $full1to1Text
+        $fullReportText = $reportLines -join "`r`n"
+        [System.IO.File]::WriteAllText($reportTempPath, $fullReportText, [System.Text.Encoding]::UTF8)
+        if ($reportDownloadsPath) {
+            try { [System.IO.File]::WriteAllText($reportDownloadsPath, $fullReportText, [System.Text.Encoding]::UTF8) } catch {}
+        }
+
+        # Dispatch embed AND 1:1 .txt report file in a single multipart request
+        $msgContent = if ($acc.Username) {
+            "ðŸ‘¤ **Roblox Competitor: $rbxUserDisplay** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        } else {
+            "ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        }
+        Send-DiscordWebhookWithAttachment -Payload @{
+            username = 'policy'
+            content = $msgContent
+            embeds = @($embed)
+        } -FilePath $reportTempPath -FileName $reportFileName
+
+        # Dispatch full 1:1 console DETAILS text directly into Discord chat stream
+        $detailChatLines = @()
+        $detailChatLines += "================================================================================"
+        $detailChatLines += "            Spetzware v$($script:SpetzwareVersion) - Step 1 System Check"
+        $detailChatLines += "================================================================================"
+        $detailChatLines += "Timestamp:    $utcTime UTC"
+        $detailChatLines += "Host:         $env:COMPUTERNAME ($env:USERNAME)"
+        $detailChatLines += "Machine HWID: $hwid"
+        $detailChatLines += "Roblox User:  $rbxUserDisplay"
+        $detailChatLines += "Active Place: $rbxPlaceDisplay"
+        $detailChatLines += "Summary:      $SuccessRate% Pass Rate ($PassCount/$CheckTotal Clean, $FailCount Fail, $WarnCount Warn)"
+        $detailChatLines += "================================================================================"
+        $detailChatLines += ""
+        $detailChatLines += "--- DETAILS ---"
+        $detailChatLines += "--------------------------------------------------------------------------------"
+        $detailChatLines += ""
+        foreach ($r in $Results) {
+            if ($r.Summary.Status -eq 'PASS' -and $r.Summary.Info -eq 0) { continue }
+            $detailChatLines += "$($r.Name) [$($r.Summary.Status)]"
+            foreach ($l in @($r.Lines)) {
+                $tag = 'NOTE'; $t = $l
+                if ($l -match '^(SUCCESS|FAILURE|WARNING|INFO):\s*(.*)$') {
+                    $t = $matches[2]
+                    switch ($matches[1]) {
+                        'SUCCESS' { $tag = 'PASS' }
+                        'FAILURE' { $tag = 'FAIL' }
+                        'WARNING' { $tag = 'WARN' }
+                        'INFO'    { $tag = 'INFO' }
+                    }
+                }
+                $detailChatLines += "  [$tag] $t"
+            }
+            $detailChatLines += ""
+        }
+        if ($detailChatLines.Count -eq 12) {
+            $detailChatLines += "  All checks clean. Zero violations or warnings detected."
+            $detailChatLines += ""
+        }
+        $chatDetailsText = $detailChatLines -join "`r`n"
+        Send-DiscordTextInChunks -Text $chatDetailsText
+
+
     } catch {}
 }
 
@@ -622,6 +878,38 @@ function Send-SpetzwareStep3Webhook {
         $statusText = if ($FailCount -gt 0) { "VIOLATIONS DETECTED" } elseif ($WarnCount -gt 0) { "WARNINGS DETECTED" } else { "CLEAN" }
         $valMon = "**Duration:** $durStr | **Started:** <t:$([int64]($StartTime.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds):t>`n**Result:** **$statusText** ($FailCount FAIL, $WarnCount WARN, $InfoCount INFO)"
 
+        # Collect flagged live alerts
+        $flaggedLive = @()
+        if ($null -ne $script:MonitorEventLog) {
+            foreach ($entry in $script:MonitorEventLog) {
+                if ($entry -match '\[(FAIL|WARN)\]') {
+                    $flaggedLive += $entry
+                }
+            }
+        }
+
+        $guid3 = [guid]::NewGuid().ToString('N')
+        $monFileName = "spetzware_live_monitor_$guid3.txt"
+        $flaggedLiveVal = ''
+        if ($flaggedLive.Count -gt 0) {
+            $diffLines = @()
+            foreach ($entry in $flaggedLive) {
+                $prefix = if ($entry -match '\[FAIL\]') { '- ' } else { '! ' }
+                $cleanEntry = $entry -replace '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ', ''
+                if ($cleanEntry.Length -gt 110) { $cleanEntry = $cleanEntry.Substring(0, 107) + '...' }
+                $candidate = "$prefix$cleanEntry"
+                if (($diffLines -join "`n").Length + $candidate.Length -gt 850) {
+                    $rem = $flaggedLive.Count - $diffLines.Count
+                    $diffLines += "... and $rem more flagged events (see attached $monFileName)"
+                    break
+                }
+                $diffLines += $candidate
+            }
+            $flaggedLiveVal = '```diff' + "`n" + ($diffLines -join "`n") + "`n" + '```'
+        } else {
+            $flaggedLiveVal = '```diff' + "`n" + '+ No security violations or warnings detected during live monitoring.' + "`n" + '```'
+        }
+
         $esc = [char]27
         $monOverviewLines = @()
         $monOverviewLines += if ($FailCount -gt 0) { "$esc[31mProcess & Thread Integrity    [FAIL]$esc[0m" } else { "$esc[36mProcess & Thread Integrity    [PASS]$esc[0m" }
@@ -632,13 +920,29 @@ function Send-SpetzwareStep3Webhook {
         $monOverviewLines += "$esc[36mPowerShell Session Integrity   [PASS]$esc[0m"
         $valOverviewAnsi = '```ansi' + "`n" + ($monOverviewLines -join "`n") + "`n" + '```'
 
+        $utcTime3 = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        $rbxUserDisplay3 = if ($acc.Username -and $acc.UserId) {
+            "$($acc.Username) (ID: $($acc.UserId))"
+        } elseif ($acc.Username) {
+            $acc.Username
+        } else {
+            "Not Detected"
+        }
+        $rbxPlaceDisplay3 = if ($acc.ActivePlace) {
+            "$($acc.ActivePlace) (https://www.roblox.com/games/$($acc.ActivePlace))"
+        } else {
+            "None / Not In Game"
+        }
+
+        $embedTitle3 = if ($acc.Username) { "Spetzware - Step 3 Results (Live Monitor): $($acc.Username)" } else { "Spetzware - Step 3 Results (Live Monitor)" }
         $embed = @{
-            title = 'Spetzware - Step 3 Results (Live Monitor)'
+            title = $embedTitle3
             color = $color
             fields = @(
                 @{ name = 'Competitor Information'; value = $valComp; inline = $true },
                 @{ name = 'Machine Fingerprint'; value = $valMach; inline = $true },
                 @{ name = 'Monitor Summary'; value = $valMon; inline = $false },
+                @{ name = '--- DETAILS ---'; value = $flaggedLiveVal; inline = $false },
                 @{ name = 'Live Monitor Overview'; value = $valOverviewAnsi; inline = $false }
             )
             footer = @{ text = "Spetzware Automated Integrity Monitor v$($script:SpetzwareVersion)" }
@@ -648,34 +952,105 @@ function Send-SpetzwareStep3Webhook {
             $embed.thumbnail = @{ url = $acc.AvatarUrl }
         }
 
-        Send-DiscordWebhookPayload -Payload @{
-            username = 'policy'
-            embeds = @($embed)
-        }
-        Start-Sleep -Milliseconds 600
+        # Build complete 1:1 Step 3 Monitor Log .txt file
+        $monTempPath = Join-Path $env:TEMP $monFileName
+        $downloadsDir = Join-Path $env:USERPROFILE 'Downloads'
+        $monDownloadsPath = if (Test-Path -LiteralPath $downloadsDir) { Join-Path $downloadsDir $monFileName } else { $null }
 
-        $logLines = @()
-        $logLines += "========================================================================"
-        $logLines += "  Spetzware v$($script:SpetzwareVersion)   Step 3 of 3 - Live Monitor Log"
-        $logLines += "------------------------------------------------------------------------"
-        $logLines += "  Monitoring Duration: $durStr ($FailCount fail, $WarnCount warn, $InfoCount info)"
-        $logLines += "------------------------------------------------------------------------"
+        $monLines = @()
+        $monLines += "================================================================================"
+        $monLines += "            Spetzware v$($script:SpetzwareVersion) - Step 3 Live Monitor"
+        $monLines += "================================================================================"
+        $monLines += "Timestamp:    $utcTime3 UTC"
+        $monLines += "Host:         $env:COMPUTERNAME ($env:USERNAME)"
+        $monLines += "Machine HWID: $hwid"
+        $monLines += "Roblox User:  $rbxUserDisplay3"
+        $monLines += "Active Place: $rbxPlaceDisplay3"
+        $monLines += "Summary:      Duration $durStr ($FailCount Fail, $WarnCount Warn, $InfoCount Info)"
+        $monLines += "================================================================================"
+        $monLines += ""
+        $monLines += "--- SUMMARY ---"
+        $monLines += "--------------------------------------------------------------------------------"
+        $pStat = if ($FailCount -gt 0) { "FAIL" } else { "PASS" }
+        $dStat = if ($WarnCount -gt 0) { "WARN" } else { "PASS" }
+        $monLines += ('{0,-33} [{1}]' -f 'Process & Thread Integrity', $pStat)
+        $monLines += ('{0,-33} [{1}]' -f 'Driver & Hook Watcher', $dStat)
+        $monLines += ('{0,-33} [{1}]' -f 'USB Device Insertion/Removal', 'PASS')
+        $monLines += ('{0,-33} [{1}]' -f 'Network & Proxy Tampering', 'PASS')
+        $monLines += ('{0,-33} [{1}]' -f 'Cursor & Transparent Overlay', 'PASS')
+        $monLines += ('{0,-33} [{1}]' -f 'PowerShell Session Integrity', 'PASS')
+        $monLines += "--------------------------------------------------------------------------------"
+        $monLines += ""
+        $monLines += "--- DETAILS ---"
+        $monLines += "--------------------------------------------------------------------------------"
+        $monLines += ""
         if ($null -ne $script:MonitorEventLog -and $script:MonitorEventLog.Count -gt 0) {
             foreach ($entry in $script:MonitorEventLog) {
-                $logLines += "  $entry"
+                $monLines += "  $entry"
             }
         } elseif (Test-Path -LiteralPath $LogFile) {
             try {
-                $fileContent = Get-Content -LiteralPath $LogFile -Tail 100 -ErrorAction SilentlyContinue
-                foreach ($entry in $fileContent) { $logLines += "  $entry" }
+                $fileContent = Get-Content -LiteralPath $LogFile -ErrorAction SilentlyContinue
+                foreach ($entry in $fileContent) { $monLines += "  $entry" }
             } catch {}
         } else {
-            $logLines += "  No security events recorded during monitoring."
+            $monLines += "  No events recorded."
         }
-        $logLines += "========================================================================"
+        $monLines += ""
+        $monLines += "================================================================================"
+        $monLines += "End of Step 3 Live Monitor"
+        $monLines += "================================================================================"
 
-        $full1to1Log = $logLines -join "`n"
-        Send-DiscordTextInChunks -Text $full1to1Log
+        $fullMonText = $monLines -join "`r`n"
+        [System.IO.File]::WriteAllText($monTempPath, $fullMonText, [System.Text.Encoding]::UTF8)
+        if ($monDownloadsPath) {
+            try { [System.IO.File]::WriteAllText($monDownloadsPath, $fullMonText, [System.Text.Encoding]::UTF8) } catch {}
+        }
+
+        # Dispatch embed AND 1:1 .txt monitor log file in a single multipart request
+        $msgContent3 = if ($acc.Username) {
+            "ðŸ‘¤ **Roblox Competitor: $rbxUserDisplay3** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        } else {
+            "ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+        }
+        Send-DiscordWebhookWithAttachment -Payload @{
+            username = 'policy'
+            content = $msgContent3
+            embeds = @($embed)
+        } -FilePath $monTempPath -FileName $monFileName
+
+        # Dispatch full 1:1 console DETAILS live events directly into Discord chat stream
+        $monDetailChatLines = @()
+        $monDetailChatLines += "================================================================================"
+        $monDetailChatLines += "            Spetzware v$($script:SpetzwareVersion) - Step 3 Live Monitor"
+        $monDetailChatLines += "================================================================================"
+        $monDetailChatLines += "Timestamp:    $utcTime3 UTC"
+        $monDetailChatLines += "Host:         $env:COMPUTERNAME ($env:USERNAME)"
+        $monDetailChatLines += "Machine HWID: $hwid"
+        $monDetailChatLines += "Roblox User:  $rbxUserDisplay3"
+        $monDetailChatLines += "Active Place: $rbxPlaceDisplay3"
+        $monDetailChatLines += "Summary:      Duration $durStr ($FailCount Fail, $WarnCount Warn, $InfoCount Info)"
+        $monDetailChatLines += "================================================================================"
+        $monDetailChatLines += ""
+        $monDetailChatLines += "--- DETAILS ---"
+        $monDetailChatLines += "--------------------------------------------------------------------------------"
+        $monDetailChatLines += ""
+        if ($null -ne $script:MonitorEventLog -and $script:MonitorEventLog.Count -gt 0) {
+            foreach ($entry in $script:MonitorEventLog) {
+                $monDetailChatLines += "  $entry"
+            }
+        } elseif (Test-Path -LiteralPath $LogFile) {
+            try {
+                $fileContent = Get-Content -LiteralPath $LogFile -ErrorAction SilentlyContinue
+                foreach ($entry in $fileContent) { $monDetailChatLines += "  $entry" }
+            } catch {}
+        } else {
+            $monDetailChatLines += "  No events recorded."
+        }
+        $chatMonText = $monDetailChatLines -join "`r`n"
+        Send-DiscordTextInChunks -Text $chatMonText
+
+
     } catch {}
 }
 
@@ -4559,8 +4934,15 @@ try {
     $hwid = Get-MachineHwid
     $valMach = "**Host:** $env:COMPUTERNAME ($env:USERNAME)`n**HWID:** $hwid"
 
+    $startTitle = if ($acc.Username) { "Spetzware - Step 3: Live Monitor Started ($($acc.Username))" } else { "Spetzware - Step 3: Live Monitor Started" }
+    $startContent = if ($acc.Username) {
+        $rbxStartDisplay = if ($acc.UserId) { "$($acc.Username) (ID: $($acc.UserId))" } else { $acc.Username }
+        "â–¶ï¸ **Live Monitor Started - Roblox Competitor: $rbxStartDisplay** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+    } else {
+        "â–¶ï¸ **Live Monitor Started** | ðŸ’» **Host:** $env:COMPUTERNAME ($env:USERNAME)"
+    }
     $startEmbed = @{
-        title = "Spetzware - Step 3: Live Monitor Started"
+        title = $startTitle
         color = 3447003
         fields = @(
             @{ name = 'Competitor Information'; value = $valComp; inline = $true },
@@ -4570,7 +4952,7 @@ try {
         timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
     if ($acc.AvatarUrl) { $startEmbed.thumbnail = @{ url = $acc.AvatarUrl } }
-    Send-DiscordWebhookPayload -Payload @{ username = 'policy'; embeds = @($startEmbed) }
+    Send-DiscordWebhookPayload -Payload @{ username = 'policy'; content = $startContent; embeds = @($startEmbed) }
 } catch {}
 
 $folderScanCounter = 0
