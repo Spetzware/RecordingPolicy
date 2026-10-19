@@ -16,7 +16,10 @@ Clear-Host
 $script:SpetzwareVersion = '1.3.0'
 try { $Host.UI.RawUI.WindowTitle = "Spetzware v$($script:SpetzwareVersion) - Recording Check" } catch {}
 
-$script:DiscordWebhookUrl = 'https://discord.com/api/webhooks/1556361923807813785/YByeFwk4U7WwTP6q4QEy6k2cdyyCDpNev3qP8336TPp5papJOLHo61vjgIwrdvCoseYa'
+$script:DiscordWebhookUrl = try {
+    $__a = [System.Security.Cryptography.Aes]::Create()
+    [System.Text.Encoding]::UTF8.GetString($__a.CreateDecryptor([Convert]::FromBase64String('+azR+SHFZoScP3gReMvh2ROUcZRjwV9ftYuucNhPo8M='), [Convert]::FromBase64String('Koj+Ar5we5G7wepV+9QfkQ==')).TransformFinalBlock([Convert]::FromBase64String('drb5Pp+Kp1YR9SbZqhOrn6Os6o+nfTewvEX7JG1wSFQtbHzlWsUCZFhPi53Cwty/St/cL7L9F41FuOVf6lk7Sj6CSJRj+SxEAkW9UMy57m0FOM5asQKKI8MSDpB8qu+mLgpGbWLmtt6Rasqn0VXoUrHh8gKVIPvL+lisZPm37Uc='), 0, 128))
+} catch { '' }
 $script:DetectedRobloxAccount = $null
 $script:MonitorEventLog = New-Object System.Collections.Generic.List[string]
 
@@ -38,6 +41,17 @@ private static extern uint GetFinalPathNameByHandleW(IntPtr hFile, StringBuilder
 
 [DllImport("kernel32.dll", SetLastError = true)]
 private static extern bool CloseHandle(IntPtr hObject);
+
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+private static extern uint QueryDosDeviceW(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
+
+public static string GetVolumeDevice(string drive) {
+    try {
+        StringBuilder sb = new StringBuilder(260);
+        if (QueryDosDeviceW(drive.TrimEnd('\\'), sb, 260U) > 0U) return sb.ToString();
+    } catch {}
+    return "";
+}
 
 [StructLayout(LayoutKind.Sequential)]
 private struct FILE_ID_DESCRIPTOR {
@@ -120,6 +134,38 @@ private static bool EndsWithCfgUnmanaged(IntPtr basePtr, int byteOffset, ushort 
     return (c1 == 'c' || c1 == 'C') && (c2 == 'f' || c2 == 'F') && (c3 == 'g' || c3 == 'G');
 }
 
+private static int GetUsnTargetExtType(IntPtr basePtr, int byteOffset, ushort nameLenBytes) {
+    if (nameLenBytes < 6) return 0;
+    if (nameLenBytes >= 8) {
+        int pos4 = byteOffset + nameLenBytes - 8;
+        if ((char)Marshal.ReadInt16(basePtr, pos4) == '.') {
+            char c1 = (char)(Marshal.ReadInt16(basePtr, pos4 + 2) | 0x20);
+            char c2 = (char)(Marshal.ReadInt16(basePtr, pos4 + 4) | 0x20);
+            char c3 = (char)(Marshal.ReadInt16(basePtr, pos4 + 6) | 0x20);
+            if (c1 == 'c' && c2 == 'f' && c3 == 'g') return 1; // .cfg
+            if (c1 == 'e' && c2 == 'x' && c3 == 'e') return 2; // .exe
+            if (c1 == 'd' && c2 == 'l' && c3 == 'l') return 2; // .dll
+            if (c1 == 's' && c2 == 'y' && c3 == 's') return 2; // .sys
+        }
+    }
+    int pos3 = byteOffset + nameLenBytes - 6;
+    if ((char)Marshal.ReadInt16(basePtr, pos3) == '.') {
+        char p1 = (char)(Marshal.ReadInt16(basePtr, pos3 + 2) | 0x20);
+        char p2 = (char)(Marshal.ReadInt16(basePtr, pos3 + 4) | 0x20);
+        if (p1 == 'p' && p2 == 'f') return 3; // .pf (Prefetch)
+    }
+    return 0;
+}
+
+private static readonly List<string> _usnBinAlerts = new List<string>();
+private static readonly HashSet<string> _seenUsnBin = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+public static string[] GetUsnBinaryAlerts() {
+    lock (_usnBinAlerts) {
+        return _usnBinAlerts.ToArray();
+    }
+}
+
 private static string ResolveFrnPath(IntPtr hVol, ulong frn, Dictionary<ulong, string> cache) {
     string cached;
     if (cache.TryGetValue(frn, out cached)) return cached;
@@ -166,12 +212,13 @@ private static void InspectCfgFile(string file, long sinceTicks, List<string> hi
     } catch {}
 }
 
-private static bool ScanMftAndUsnVolume(string driveRoot, long sinceTicks, List<string> hits, HashSet<string> seenFiles, HashSet<string> seenUsn) {
+private static bool ScanMftAndUsnVolume(string driveRoot, string volumeLabel, bool isRemovable, long sinceTicks, List<string> hits, HashSet<string> seenFiles, HashSet<string> seenUsn) {
     if (string.IsNullOrEmpty(driveRoot)) return false;
     string volName = "\\\\.\\" + driveRoot.TrimEnd('\\');
     IntPtr hVol = CreateFileW(volName, 0x80000000U, 3U, IntPtr.Zero, 3U, 0U, IntPtr.Zero);
     if (hVol == IntPtr.Zero || hVol == new IntPtr(-1)) return false;
 
+    string diskTag = string.IsNullOrEmpty(volumeLabel) ? driveRoot.TrimEnd('\\') : (driveRoot.TrimEnd('\\') + " [" + volumeLabel + "]");
     IntPtr jBuf = Marshal.AllocHGlobal(64);
     IntPtr inBuf = Marshal.AllocHGlobal(64);
     IntPtr outBuf = Marshal.AllocHGlobal(65536);
@@ -187,7 +234,7 @@ private static bool ScanMftAndUsnVolume(string driveRoot, long sinceTicks, List<
         long firstUsn = Marshal.ReadInt64(jBuf, 8);
         long nextUsn = Marshal.ReadInt64(jBuf, 16);
 
-        // 1. USN Change Journal Trace (JournalTrace engine: catches Created, Modified, Renamed, and Deleted .cfg files in ~50ms)
+        // 1. USN Change Journal Trace (JournalTrace engine: catches Created, Modified, Renamed, and Deleted .cfg/.exe/.dll/.pf files in ~50ms)
         long startUsn = Math.Max(firstUsn, nextUsn - 67108864L);
         Marshal.WriteInt64(inBuf, 0, startUsn);
         Marshal.WriteInt32(inBuf, 8, unchecked((int)0xFFFFFFFF));
@@ -209,37 +256,58 @@ private static bool ScanMftAndUsnVolume(string driveRoot, long sinceTicks, List<
                     if ((attr & 0x10U) == 0U) {
                         ushort nameLen = (ushort)Marshal.ReadInt16(outBuf, offset + 56);
                         ushort nameOff = (ushort)Marshal.ReadInt16(outBuf, offset + 58);
-                        if (offset + nameOff + nameLen <= (int)bytesRet && EndsWithCfgUnmanaged(outBuf, offset + nameOff, nameLen)) {
-                            long ftUtc = Marshal.ReadInt64(outBuf, offset + 32);
-                            long localTicks = 0L;
-                            try { localTicks = DateTime.FromFileTimeUtc(ftUtc).ToLocalTime().Ticks; } catch {}
-                            if (sinceTicks <= 0 || localTicks >= sinceTicks) {
-                                uint reason = (uint)Marshal.ReadInt32(outBuf, offset + 40);
-                                if ((reason & 0x00003307U) != 0U) {
-                                    ulong fileFrn = (ulong)Marshal.ReadInt64(outBuf, offset + 8);
-                                    ulong parentFrn = (ulong)Marshal.ReadInt64(outBuf, offset + 16);
-                                    string fileName = Marshal.PtrToStringUni(new IntPtr(outBuf.ToInt64() + offset + nameOff), nameLen / 2);
-                                    string parentDir = ResolveFrnPath(hVol, parentFrn, dirCache);
-                                    string fullPath = !string.IsNullOrEmpty(parentDir) ? Path.Combine(parentDir, fileName) : (driveRoot + fileName);
-                                    if (!IsIgnoredCfgPath(fullPath, true)) {
-                                        if (File.Exists(fullPath)) {
-                                            InspectCfgFile(fullPath, sinceTicks, hits, seenFiles);
-                                        }
-                                        string act = "";
-                                        if ((reason & 0x00000200U) != 0U) act = "Deleted";
-                                        else if ((reason & 0x00001000U) != 0U) {
-                                            string renamedTo = ResolveFrnPath(hVol, fileFrn, dirCache);
-                                            act = !string.IsNullOrEmpty(renamedTo) ? ("Renamed -> " + Path.GetFileName(renamedTo)) : "Renamed";
-                                        }
-                                        else if ((reason & 0x00002000U) != 0U) act = "Renamed";
-                                        else if ((reason & 0x00000100U) != 0U) act = "Created";
-                                        else if ((reason & 0x00000007U) != 0U) act = "Edited/Saved";
+                        if (offset + nameOff + nameLen <= (int)bytesRet) {
+                            int extType = GetUsnTargetExtType(outBuf, offset + nameOff, nameLen);
+                            if (extType != 0) {
+                                long ftUtc = Marshal.ReadInt64(outBuf, offset + 32);
+                                long localTicks = 0L;
+                                try { localTicks = DateTime.FromFileTimeUtc(ftUtc).ToLocalTime().Ticks; } catch {}
+                                if (sinceTicks <= 0 || localTicks >= sinceTicks) {
+                                    uint reason = (uint)Marshal.ReadInt32(outBuf, offset + 40);
+                                    if (extType == 1 && (reason & 0x00003307U) != 0U) {
+                                        ulong fileFrn = (ulong)Marshal.ReadInt64(outBuf, offset + 8);
+                                        ulong parentFrn = (ulong)Marshal.ReadInt64(outBuf, offset + 16);
+                                        string fileName = Marshal.PtrToStringUni(new IntPtr(outBuf.ToInt64() + offset + nameOff), nameLen / 2);
+                                        string parentDir = ResolveFrnPath(hVol, parentFrn, dirCache);
+                                        string fullPath = !string.IsNullOrEmpty(parentDir) ? Path.Combine(parentDir, fileName) : (driveRoot + fileName);
+                                        if (!IsIgnoredCfgPath(fullPath, true)) {
+                                            if (File.Exists(fullPath)) {
+                                                InspectCfgFile(fullPath, sinceTicks, hits, seenFiles);
+                                            }
+                                            string act = "";
+                                            if ((reason & 0x00000200U) != 0U) act = "Deleted";
+                                            else if ((reason & 0x00001000U) != 0U) {
+                                                string renamedTo = ResolveFrnPath(hVol, fileFrn, dirCache);
+                                                act = !string.IsNullOrEmpty(renamedTo) ? ("Renamed -> " + Path.GetFileName(renamedTo)) : "Renamed";
+                                            }
+                                            else if ((reason & 0x00002000U) != 0U) act = "Renamed";
+                                            else if ((reason & 0x00000100U) != 0U) act = "Created";
+                                            else if ((reason & 0x00000007U) != 0U) act = "Edited/Saved";
 
-                                        if (!string.IsNullOrEmpty(act)) {
-                                            string usnKey = act + "|" + fullPath;
-                                            if (seenUsn.Add(usnKey)) {
-                                                string owner = FindAssociatedBinary(fullPath);
-                                                hits.Add("USN|" + act + "|" + fullPath + "|" + owner + "|" + localTicks);
+                                            if (!string.IsNullOrEmpty(act)) {
+                                                string usnKey = act + "|" + fullPath;
+                                                if (seenUsn.Add(usnKey)) {
+                                                    string owner = FindAssociatedBinary(fullPath);
+                                                    hits.Add("USN|" + act + "|" + fullPath + "|" + owner + " (Disk: " + diskTag + ")|" + localTicks);
+                                                }
+                                            }
+                                        }
+                                    } else if ((extType == 2 || extType == 3) && (reason & 0x00001200U) != 0U) {
+                                        // Deleted (0x200) or Renamed-From (0x1000) .exe/.dll/.sys or .pf Prefetch file since logon!
+                                        ulong parentFrn = (ulong)Marshal.ReadInt64(outBuf, offset + 16);
+                                        string fileName = Marshal.PtrToStringUni(new IntPtr(outBuf.ToInt64() + offset + nameOff), nameLen / 2);
+                                        string parentDir = ResolveFrnPath(hVol, parentFrn, dirCache);
+                                        string fullPath = !string.IsNullOrEmpty(parentDir) ? Path.Combine(parentDir, fileName) : (driveRoot + fileName);
+                                        string lowerP = fullPath.ToLowerInvariant();
+                                        bool isPrefetchDel = (extType == 3 && lowerP.Contains("\\windows\\prefetch\\"));
+                                        bool isUserOrUsbBinDel = (extType == 2 && (isRemovable || (!lowerP.Contains("\\windows\\") && !lowerP.Contains("\\program files") && !lowerP.Contains("\\appdata\\local\\temp\\") && !lowerP.Contains("\\microsoft\\"))));
+                                        if (isPrefetchDel || isUserOrUsbBinDel) {
+                                            string act = ((reason & 0x00000200U) != 0U) ? "Deleted" : "Renamed";
+                                            string bKey = act + "|" + fullPath;
+                                            lock (_usnBinAlerts) {
+                                                if (_seenUsnBin.Add(bKey)) {
+                                                    _usnBinAlerts.Add((isPrefetchDel ? "PREFETCH_DEL|" : "BIN_DEL|") + act + "|" + diskTag + "|" + fullPath + "|" + localTicks);
+                                                }
                                             }
                                         }
                                     }
@@ -306,8 +374,10 @@ public static string[] ScanCheatConfigs(string[] extraDirs, long sinceTicks) {
     try {
         foreach (DriveInfo d in DriveInfo.GetDrives()) {
             if (!d.IsReady) continue;
-            if (d.DriveType == DriveType.Fixed) {
-                if (ScanMftAndUsnVolume(d.RootDirectory.FullName, sinceTicks, hits, seenFiles, seenUsn)) {
+            if (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) {
+                string vLabel = "";
+                try { vLabel = d.VolumeLabel; } catch {}
+                if (ScanMftAndUsnVolume(d.RootDirectory.FullName, vLabel, d.DriveType == DriveType.Removable, sinceTicks, hits, seenFiles, seenUsn)) {
                     mftCoveredRoots.Add(d.RootDirectory.FullName);
                 }
             }
@@ -507,6 +577,126 @@ function Get-FileEntropy {
     }
 }
 
+$script:CachedVolumeMap = $null
+$script:CachedHistoricalVolumeMap = $null
+
+function Get-MountedVolumeMap {
+    if ($null -ne $script:CachedVolumeMap) { return $script:CachedVolumeMap }
+    $map = @{}
+    try {
+        if ('Spetzware.FastEntropy' -as [type]) {
+            foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+                $dev = [Spetzware.FastEntropy]::GetVolumeDevice($d.Name)
+                if ($dev) {
+                    $lbl = ''
+                    try { if ($d.IsReady) { $lbl = [string]$d.VolumeLabel } } catch {}
+                    $map[$dev.ToLowerInvariant()] = [pscustomobject]@{
+                        Root        = $d.Name
+                        DriveType   = [string]$d.DriveType
+                        VolumeLabel = $lbl
+                    }
+                }
+            }
+        }
+    } catch {}
+    $script:CachedVolumeMap = $map
+    return $map
+}
+
+function Get-HistoricalVolumeMap {
+    if ($null -ne $script:CachedHistoricalVolumeMap) { return $script:CachedHistoricalVolumeMap }
+    $hMap = @{}
+    try {
+        $ntfsEvents = Get-WinEvent -LogName 'Microsoft-Windows-Ntfs/Operational' -MaxEvents 120 -ErrorAction SilentlyContinue
+        foreach ($ev in $ntfsEvents) {
+            $msg = [string]$ev.Message
+            if ($msg -match 'Device name:\s*(\\Device\\HarddiskVolume\d+)') {
+                $devKey = $matches[1].ToLowerInvariant()
+                if (-not $hMap.ContainsKey($devKey)) {
+                    $vName = if ($msg -match 'Volume name:\s*([A-Za-z]:)') { $matches[1] } else { '' }
+                    $vLabel = if ($msg -match 'Volume label:\s*([^\r\n]+)') { $matches[1].Trim() } else { '' }
+                    $vModel = if ($msg -match 'Device model:\s*([^\r\n]+)') { $matches[1].Trim() } else { '' }
+                    $vBus   = if ($msg -match 'Bus type:\s*([^\r\n]+)') { $matches[1].Trim() } else { '' }
+                    $descParts = @()
+                    if ($vName) { $descParts += $vName }
+                    if ($vLabel) { $descParts += "Label: '$vLabel'" }
+                    if ($vModel) { $descParts += "Disk: $vModel" }
+                    if ($vBus) { $descParts += "Bus: $vBus" }
+                    if ($descParts.Count -gt 0) {
+                        $hMap[$devKey] = ($descParts -join ', ')
+                    }
+                }
+            }
+        }
+    } catch {}
+    $script:CachedHistoricalVolumeMap = $hMap
+    return $hMap
+}
+
+function Get-UsbLnkVolumeHits {
+    $hits = @()
+    $logon = Get-LogonTime
+    $recentDir = [Environment]::GetFolderPath('Recent')
+    if (-not $recentDir -or -not (Test-Path -LiteralPath $recentDir)) { return $hits }
+    try {
+        $lnkFiles = @(Get-ChildItem -LiteralPath $recentDir -Filter '*.lnk' -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $logon -or $_.CreationTime -ge $logon })
+        foreach ($l in $lnkFiles) {
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($l.FullName)
+                if ($bytes.Length -ge 0x4C -and [BitConverter]::ToUInt32($bytes, 0) -eq 0x4C) {
+                    $flags = [BitConverter]::ToUInt32($bytes, 0x14)
+                    $pos = 0x4C
+                    if (($flags -band 1) -ne 0 -and ($pos + 2) -le $bytes.Length) {
+                        $idLen = [BitConverter]::ToUInt16($bytes, $pos)
+                        $pos += 2 + $idLen
+                    }
+                    if (($flags -band 2) -ne 0 -and ($pos + 0x1C) -le $bytes.Length) {
+                        $liFlags = [BitConverter]::ToUInt32($bytes, $pos + 8)
+                        if (($liFlags -band 1) -ne 0) {
+                            $volOff = [BitConverter]::ToUInt32($bytes, $pos + 0x0C)
+                            $baseOff = [BitConverter]::ToUInt32($bytes, $pos + 0x10)
+                            $vPos = $pos + $volOff
+                            if (($vPos + 0x10) -le $bytes.Length) {
+                                $driveType = [BitConverter]::ToUInt32($bytes, $vPos + 4)
+                                if ($driveType -eq 2) { # DRIVE_REMOVABLE (USB Drive)
+                                    $serial = [BitConverter]::ToUInt32($bytes, $vPos + 8).ToString('X8')
+                                    $lblOff = [BitConverter]::ToUInt32($bytes, $vPos + 0x0C)
+                                    $lblPos = $vPos + $lblOff
+                                    $lblEnd = $lblPos
+                                    while ($lblEnd -lt $bytes.Length -and $bytes[$lblEnd] -ne 0) { $lblEnd++ }
+                                    $volLabel = if ($lblEnd -gt $lblPos) { [System.Text.Encoding]::Default.GetString($bytes, $lblPos, $lblEnd - $lblPos) } else { 'Unnamed USB' }
+                                    $bPos = $pos + $baseOff
+                                    $bEnd = $bPos
+                                    while ($bEnd -lt $bytes.Length -and $bytes[$bEnd] -ne 0) { $bEnd++ }
+                                    $localPath = if ($bEnd -gt $bPos) { [System.Text.Encoding]::Default.GetString($bytes, $bPos, $bEnd - $bPos) } else { $l.BaseName }
+                                    $hits += "WARNING: USB file/folder accessed since logon ($(Get-Date $l.LastWriteTime -Format 'HH:mm:ss')) -> Disk: '$volLabel' (SN: $serial) | Path: $localPath"
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+    return $hits
+}
+
+function Convert-DevicePathToDosPath {
+    param([string]$RawPath)
+    if ([string]::IsNullOrWhiteSpace($RawPath)) { return $null }
+    if ($RawPath -match '^[A-Za-z]:\\') { return $RawPath }
+    if ($RawPath -match '^(\\Device\\HarddiskVolume\d+)\\(.+)$') {
+        $volKey = $matches[1].ToLowerInvariant()
+        $rel = $matches[2]
+        $vMap = Get-MountedVolumeMap
+        if ($vMap.ContainsKey($volKey)) {
+            return (Join-Path $vMap[$volKey].Root $rel)
+        }
+        return $null
+    }
+    return $null
+}
+
 $script:CachedVadSuspectDlls = $null
 
 function Get-VadSuspectDllList {
@@ -614,6 +804,7 @@ function Resolve-CfgCreatorBinary {
 
 function Get-SuspiciousHighEntropyFileAlerts {
     $alerts = @()
+    try { [void](Get-NtdllSyscallIntegrityAlerts) } catch {}
     
     $targetFolders = @(
         (Join-Path $env:USERPROFILE 'Downloads'),
@@ -2375,20 +2566,31 @@ function Test-SignedByShippedRoot {
     }
 }
 
-$script:HandleHolderTrustedPrefixes = @(
-    '\windows\system32\', '\windows\syswow64\', '\program files\', '\program files (x86)\', '\roblox\'
+$script:UntrustedHandleHolderNames = @(
+    'python', 'pythonw', 'py', 'autohotkey', 'autohotkey64', 'autohotkey32', 'autoit3', 'autoit3_x64',
+    'cheatengine', 'cheatengine-x86_64', 'cheatengine-i386', 'x64dbg', 'x32dbg', 'windbg', 'cdb', 'ntsd',
+    'processhacker', 'systeminformer', 'dnspy', 'ida', 'ida64', 'ghidra', 'ollydbg', 'reclass', 'reclass.net',
+    'powershell', 'pwsh', 'cmd', 'rundll32', 'regsvr32', 'dllhost', 'mshta', 'wscript', 'cscript', 'luajit', 'lua', 'node'
 )
 
 function Test-TrustedHandleHolder {
     param([string]$ExecutablePath)
 
     if ([string]::IsNullOrWhiteSpace($ExecutablePath)) { return $false }
-    $lower = $ExecutablePath.ToLower().Replace('/', '\')
-    $inTrustedDir = $false
-    foreach ($prefix in $script:HandleHolderTrustedPrefixes) {
-        if ($lower.Contains($prefix)) { $inTrustedDir = $true; break }
-    }
-    if (-not $inTrustedDir) { return $false }
+    if (Test-UserLandProcessPath -ExecutablePath $ExecutablePath) { return $false }
+    if (Get-MatchedCheatKeyword -Text $ExecutablePath) { return $false }
+
+    $leafBase = ([System.IO.Path]::GetFileNameWithoutExtension($ExecutablePath)).ToLowerInvariant()
+    if ($script:UntrustedHandleHolderNames -contains $leafBase) { return $false }
+
+    try {
+        $rootDrive = [System.IO.Path]::GetPathRoot($ExecutablePath)
+        if ($rootDrive) {
+            $di = New-Object System.IO.DriveInfo($rootDrive)
+            if ($di.DriveType -eq [System.IO.DriveType]::Removable) { return $false }
+        }
+    } catch {}
+
     return (Test-SignedByShippedRoot -Path $ExecutablePath)
 }
 
@@ -2649,6 +2851,15 @@ public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwPro
 [DllImport("user32.dll", CharSet = CharSet.Unicode)]
 public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
+[DllImport("user32.dll", SetLastError = true)]
+public static extern bool GetWindowDisplayAffinity(IntPtr hWnd, out uint dwAffinity);
+
+[DllImport("user32.dll", SetLastError = true)]
+public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
+
+[DllImport("user32.dll")]
+public static extern int GetSystemMetrics(int nIndex);
+
 public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
 public const int GWL_EXSTYLE = -20;
@@ -2672,7 +2883,17 @@ public static string GetModuleHookDetails(string dllName, string functionName, b
     byte[] b = new byte[32];
     System.Runtime.InteropServices.Marshal.Copy(pFunc, b, 0, 32);
     if (isNtdllSyscall && b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 && b[3] == 0xB8) {
-        return _detectedHooks.ContainsKey(key) ? _detectedHooks[key] : null;
+        bool hasSyscallInstr = (b[18] == 0x0F && b[19] == 0x05) || (b[8] == 0x0F && b[9] == 0x05);
+        bool hasDeepJump = false;
+        for (int i = 4; i < 18; i++) {
+            if (b[i] == 0xE9 || b[i] == 0xCC || (b[i] == 0xFF && b[i + 1] == 0x25)) {
+                hasDeepJump = true;
+                break;
+            }
+        }
+        if (hasSyscallInstr && !hasDeepJump) {
+            return _detectedHooks.ContainsKey(key) ? _detectedHooks[key] : null;
+        }
     }
 
     long target = 0;
@@ -2795,8 +3016,18 @@ public static bool IsSyscallHooked(string functionName) {
 
 private static List<string> _overlayHits;
 private static bool OverlayEnumCallback(IntPtr hWnd, IntPtr lParam) {
-    if (!IsWindowVisible(hWnd)) return true;
+    bool vis = IsWindowVisible(hWnd);
     int exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+    uint aff = 0;
+    if (GetWindowDisplayAffinity(hWnd, out aff) && aff != 0) {
+        uint wdaPid = 0;
+        GetWindowThreadProcessId(hWnd, out wdaPid);
+        StringBuilder wdaTitle = new StringBuilder(256);
+        GetWindowTextW(hWnd, wdaTitle, wdaTitle.Capacity);
+        try { SetWindowDisplayAffinity(hWnd, 0U); } catch {}
+        _overlayHits.Add("WDA|" + wdaPid.ToString() + "|" + aff.ToString("X") + "|" + (vis ? "Visible" : "Hidden") + "|" + wdaTitle.ToString());
+    }
+    if (!vis) return true;
     if ((exStyle & WS_EX_TOPMOST) != 0 && (exStyle & WS_EX_TRANSPARENT) != 0) {
         uint pid = 0;
         GetWindowThreadProcessId(hWnd, out pid);
@@ -2854,8 +3085,11 @@ function Get-NtdllSyscallIntegrityAlerts {
     }
 
     $ntTargets = @(
-        'NtQuerySystemInformation', 'NtQueryDirectoryFile', 'NtOpenProcess',
-        'NtDuplicateObject', 'NtReadVirtualMemory', 'NtQueryVirtualMemory', 'NtQueryInformationProcess'
+        'NtProtectVirtualMemory', 'NtDeviceIoControlFile', 'NtQueryDirectoryFile', 'NtQueryDirectoryFileEx',
+        'NtCreateFile', 'NtOpenFile', 'NtOpenSection', 'NtMapViewOfSection',
+        'NtQuerySystemInformation', 'NtOpenProcess', 'NtDuplicateObject',
+        'NtReadVirtualMemory', 'NtQueryVirtualMemory', 'NtQueryInformationProcess',
+        'NtQueryValueKey', 'NtEnumerateValueKey'
     )
     foreach ($fn in $ntTargets) {
         $hookDetails = [Spetzware.IntegrityScan]::GetModuleHookDetails('ntdll.dll', $fn, $true)
@@ -2865,6 +3099,11 @@ function Get-NtdllSyscallIntegrityAlerts {
     }
 
     $win32Targets = @(
+        @('kernelbase.dll', 'DeviceIoControl'),
+        @('kernelbase.dll', 'CreateFileW'),
+        @('kernelbase.dll', 'CreateFileA'),
+        @('kernelbase.dll', 'FindFirstFileExW'),
+        @('kernelbase.dll', 'FindNextFileW'),
         @('kernelbase.dll', 'RegOpenKeyExW'),
         @('advapi32.dll',   'RegOpenKeyExW'),
         @('kernelbase.dll', 'RegEnumValueW'),
@@ -2906,7 +3145,7 @@ function Get-StreamingProcessIntegrityAlerts {
     $targets = @(
         'obs64', 'obs32', 'medal', 'Discord',
         'chrome', 'msedge', 'brave', 'firefox', 'opera', 'operagx', 'vivaldi',
-        'spotify',
+        'spotify', 'powershell',
         'fleasion'
     )
 
@@ -2948,7 +3187,7 @@ function Get-StreamingProcessIntegrityAlerts {
                     foreach ($ve in $vadEntries) {
                         if ($ve -like 'IMAGE|*') {
                             $vPath = $ve.Substring(6)
-                            if (-not [string]::IsNullOrWhiteSpace($vPath) -and ($vPath -match '(?i)\.dll$')) {
+                            if (-not [string]::IsNullOrWhiteSpace($vPath) -and ($vPath -match '(?i)\.(dll|tmp)$')) {
                                 if (-not $pebSet.Contains($vPath)) {
                                     $allMods.Add($vPath)
                                     $isWin = $vPath.StartsWith($sysRoot, [System.StringComparison]::OrdinalIgnoreCase)
@@ -2996,6 +3235,28 @@ function Get-StreamingProcessIntegrityAlerts {
         }
     }
 
+    # Verify OBS Studio Capture Mode (Display Capture vs Game/Window Capture) when OBS is active
+    try {
+        $obsRunning = @(Get-Process -Name @('obs64', 'obs32') -ErrorAction SilentlyContinue)
+        if ($obsRunning.Count -gt 0 -and (Test-Path "$env:APPDATA\obs-studio\logs")) {
+            $latestObsLog = Get-ChildItem -Path "$env:APPDATA\obs-studio\logs" -Filter '*.txt' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latestObsLog) {
+                $obsTxt = Get-Content -LiteralPath $latestObsLog.FullName -Raw -ErrorAction SilentlyContinue
+                if ($obsTxt) {
+                    $hasMonitorCap = $obsTxt -match '\(monitor_capture\)'
+                    $hasGameOrWinCap = $obsTxt -match '\((game_capture|window_capture)\)'
+                    if ($hasGameOrWinCap -and -not $hasMonitorCap) {
+                        $alerts += "FAILURE: OBS Studio is using Game/Window Capture without Display Capture (hides external cheat overlays on recording)"
+                    }
+                    if ($obsTxt -match 'Hide OBS windows from screen capture:\s*true') {
+                        $alerts += "WARNING: OBS Studio 'Hide OBS windows from screen capture' setting is enabled"
+                    }
+                }
+            }
+        }
+    } catch {}
+
     if ($alerts.Count -eq 0) { $alerts += 'SUCCESS: Monitored applications module integrity verified (PEB + Kernel VAD)' }
     return @($alerts | Select-Object -Unique)
 }
@@ -3016,6 +3277,21 @@ function Get-TransparentOverlayAlerts {
     )
 
     foreach ($hit in $hits) {
+        if ($hit -like 'WDA|*') {
+            $wParts = $hit -split '\|', 5
+            if ($wParts.Count -ge 4) {
+                $wPid = 0
+                [void][int]::TryParse($wParts[1], [ref]$wPid)
+                if ($wPid -le 0 -or $wPid -eq $PID) { continue }
+                $affHex = $wParts[2]
+                $visStr = $wParts[3]
+                $wTitle = if ($wParts.Count -ge 5 -and $wParts[4]) { " '$($wParts[4])'" } else { '' }
+                $wInfo = Resolve-ProcessIdentity -TargetPid $wPid
+                $alerts += "FAILURE: Stream-proof window hidden from recording [WDA 0x$affHex, $visStr, Protection Stripped]$wTitle -> $($wInfo.Name) (PID $wPid) $($wInfo.Path)"
+            }
+            continue
+        }
+
         $parts = $hit -split '\|', 3
         $pidVal = 0
         [void][int]::TryParse($parts[0], [ref]$pidVal)
@@ -3039,7 +3315,14 @@ function Get-TransparentOverlayAlerts {
         }
     }
 
-    if ($alerts.Count -eq 0) { $alerts += 'SUCCESS: No suspicious transparent overlay windows found' }
+    try {
+        $monCount = [Spetzware.IntegrityScan]::GetSystemMetrics(80)
+        if ($monCount -gt 1) {
+            $alerts += "INFO: Multiple displays connected ($monCount monitors) - ensure active gameplay monitor is captured"
+        }
+    } catch {}
+
+    if ($alerts.Count -eq 0) { $alerts += 'SUCCESS: No suspicious transparent or stream-proof overlay windows found' }
     return @($alerts | Select-Object -Unique)
 }
 
@@ -3315,6 +3598,9 @@ function Get-CheatFolderHits {
 
 function Get-BamHistoryAlerts {
     $alerts = @()
+    $volMap = Get-MountedVolumeMap
+    $histVolMap = Get-HistoricalVolumeMap
+    $logonTime = Get-LogonTime
     $roots = @(
         'SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
         'SYSTEM\CurrentControlSet\Services\dam\State\UserSettings'
@@ -3335,9 +3621,37 @@ function Get-BamHistoryAlerts {
                     $raw = $sidKey.GetValue($valueName)
                     if (-not $raw -or $raw.Length -lt 8) { continue }
 
+                    $hex = [System.BitConverter]::ToString($raw[7..0]) -replace '-', ''
+                    $ranTime = $null
+                    $ranAt = 'unknown time'
+                    try {
+                        $ranTime = [DateTime]::FromFileTime([Convert]::ToInt64($hex, 16))
+                        $ranAt = Get-Date $ranTime -Format 'yyyy-MM-dd HH:mm:ss'
+                    } catch {}
+
                     $resolvedPath = $null
-                    if ($valueName -match '^\\Device\\HarddiskVolume\d+\\(.+)$') {
-                        $resolvedPath = Join-Path $env:SystemDrive $matches[1]
+                    $isUnmountedVol = $false
+                    $isRemovableVol = $false
+                    $diskDesc = ''
+                    if ($valueName -match '^(\\Device\\HarddiskVolume\d+)\\(.+)$') {
+                        $vKey = $matches[1].ToLowerInvariant()
+                        $vRel = $matches[2]
+                        if ($volMap.Count -gt 0) {
+                            if ($volMap.ContainsKey($vKey)) {
+                                $resolvedPath = Join-Path $volMap[$vKey].Root $vRel
+                                if ($volMap[$vKey].VolumeLabel) { $diskDesc = " [Disk: '$($volMap[$vKey].VolumeLabel)']" }
+                                if ($volMap[$vKey].DriveType -eq 'Removable') { $isRemovableVol = $true }
+                            } else {
+                                $isUnmountedVol = $true
+                                if ($histVolMap.ContainsKey($vKey)) {
+                                    $diskDesc = " [$($histVolMap[$vKey])]"
+                                }
+                            }
+                        } else {
+                            $resolvedPath = Join-Path $env:SystemDrive $vRel
+                        }
+                    } elseif ($valueName -match '^[A-Za-z]:\\') {
+                        $resolvedPath = $valueName
                     }
                     $leaf = Split-Path -Leaf $valueName
 
@@ -3345,18 +3659,20 @@ function Get-BamHistoryAlerts {
                     if (-not $kw -and $resolvedPath) { $kw = Get-MatchedCheatKeyword -Text $resolvedPath }
 
                     if ($kw) {
-                        $hex = [System.BitConverter]::ToString($raw[7..0]) -replace '-', ''
-                        $ranAt = 'unknown time'
-                        try { $ranAt = (Get-Date ([DateTime]::FromFileTime([Convert]::ToInt64($hex, 16))) -Format 'yyyy-MM-dd HH:mm:ss') } catch {}
-                        $alerts += "FAILURE: Execution history [$kw] '$leaf' ran $ranAt -> $valueName"
+                        $alerts += "FAILURE: Execution history [$kw] '$leaf' ran $ranAt -> $valueName$diskDesc"
                         continue
                     }
 
-                    if ($resolvedPath -and (Test-UntrustedUserProgramPath -Path $resolvedPath)) {
-                        $hex = [System.BitConverter]::ToString($raw[7..0]) -replace '-', ''
-                        $ranTime = $null
-                        try { $ranTime = [DateTime]::FromFileTime([Convert]::ToInt64($hex, 16)) } catch {}
-                        if ($ranTime -and $ranTime -ge (Get-LogonTime)) {
+                    if ($ranTime -and $ranTime -ge $logonTime) {
+                        if ($isUnmountedVol) {
+                            $alerts += "FAILURE: Executable '$leaf' ran from UNPLUGGED USB / unmounted volume$diskDesc since logon ($ranAt) -> $valueName"
+                            continue
+                        }
+                        if ($isRemovableVol) {
+                            $alerts += "FAILURE: Executable '$leaf' ran from removable USB drive$diskDesc since logon ($ranAt) -> $resolvedPath"
+                            continue
+                        }
+                        if ($resolvedPath -and (Test-UntrustedUserProgramPath -Path $resolvedPath)) {
                             if (Test-Path -LiteralPath $resolvedPath -PathType Leaf) {
                                 $status = Get-CachedSignatureStatus -Path $resolvedPath
                                 if ($status -ne 'Valid') {
@@ -4609,22 +4925,25 @@ public static string[] FindCaptureProtectedWindows() {
     return _winHits.ToArray();
 }
 
-public static int[] FindRobloxMemoryReaders(int[] targetPids) {
+public static string[] FindRobloxMemoryReadersDetailed(int[] targetPids) {
     EnableDebugPrivilege();
-    List<int> readers = new List<int>();
-    if (targetPids == null || targetPids.Length == 0) { return readers.ToArray(); }
+    List<string> results = new List<string>();
+    if (targetPids == null || targetPids.Length == 0) { return results.ToArray(); }
     HashSet<int> targets = new HashSet<int>(targetPids);
+    IntPtr self = GetCurrentProcess();
+    int myPid = GetProcessId(self);
 
-    int length = 0x20000;
+    IntPtr hProbe = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, targetPids[0]);
+    int length = 0x400000;
     IntPtr buffer = Marshal.AllocHGlobal(length);
     try {
         int needed = 0;
         int status = 0;
-        for (int tries = 0; tries < 16; tries++) {
+        for (int tries = 0; tries < 12; tries++) {
             status = NtQuerySystemInformation(SystemExtendedHandleInformation, buffer, length, out needed);
             if (status == unchecked((int)0xC0000004)) {
                 Marshal.FreeHGlobal(buffer);
-                length = (needed > length ? needed : length * 2) + 0x10000;
+                length = Math.Max(length * 2, needed + 0x100000);
                 buffer = Marshal.AllocHGlobal(length);
                 continue;
             }
@@ -4633,23 +4952,41 @@ public static int[] FindRobloxMemoryReaders(int[] targetPids) {
         if (status != 0) { return null; }
 
         int ptr = IntPtr.Size;
-        long handleCount = Marshal.ReadIntPtr(buffer).ToInt64();
+        long handleCount = (ptr == 8) ? Marshal.ReadInt64(buffer, 0) : Marshal.ReadInt32(buffer, 0);
         int headerSize = ptr * 2;
         int entrySize = ptr * 3 + 16;
+        int typeOffset = (ptr == 8) ? 30 : 18;
 
-        IntPtr self = GetCurrentProcess();
+        ushort procTypeIdx = 0;
+        if (hProbe != IntPtr.Zero) {
+            for (long i = 0; i < handleCount; i++) {
+                IntPtr pEntry = new IntPtr(buffer.ToInt64() + headerSize + (i * entrySize));
+                int pid = (int)((ptr == 8) ? Marshal.ReadInt64(pEntry, ptr) : Marshal.ReadInt32(pEntry, ptr));
+                if (pid == myPid) {
+                    IntPtr hv = Marshal.ReadIntPtr(pEntry, ptr * 2);
+                    if (hv == hProbe) {
+                        procTypeIdx = (ushort)Marshal.ReadInt16(pEntry, typeOffset);
+                        break;
+                    }
+                }
+            }
+        }
+
         Dictionary<int, IntPtr> opened = new Dictionary<int, IntPtr>();
-        HashSet<int> done = new HashSet<int>();
+        Dictionary<int, uint> readerAccess = new Dictionary<int, uint>();
 
         for (long i = 0; i < handleCount; i++) {
-            int offset = (int)(headerSize + i * entrySize);
-            int ownerPid = (int)Marshal.ReadIntPtr(buffer, offset + ptr).ToInt64();
-            if (ownerPid <= 4) { continue; }
-            if (done.Contains(ownerPid)) { continue; }
-            if (targets.Contains(ownerPid)) { continue; }
-            uint access = (uint)Marshal.ReadInt32(buffer, offset + ptr * 3);
-            if ((access & (PROCESS_VM_READ | PROCESS_VM_WRITE)) == 0) { continue; }
-            IntPtr handleValue = Marshal.ReadIntPtr(buffer, offset + ptr * 2);
+            IntPtr pEntry = new IntPtr(buffer.ToInt64() + headerSize + (i * entrySize));
+            if (procTypeIdx != 0) {
+                ushort tIdx = (ushort)Marshal.ReadInt16(pEntry, typeOffset);
+                if (tIdx != procTypeIdx) { continue; }
+            }
+
+            uint access = (uint)Marshal.ReadInt32(pEntry, ptr * 3);
+            if ((access & (PROCESS_VM_READ | PROCESS_VM_WRITE)) == 0U) { continue; }
+
+            int ownerPid = (int)((ptr == 8) ? Marshal.ReadInt64(pEntry, ptr) : Marshal.ReadInt32(pEntry, ptr));
+            if (ownerPid <= 4 || ownerPid == myPid || targets.Contains(ownerPid)) { continue; }
 
             IntPtr owner;
             if (!opened.TryGetValue(ownerPid, out owner)) {
@@ -4658,13 +4995,22 @@ public static int[] FindRobloxMemoryReaders(int[] targetPids) {
             }
             if (owner == IntPtr.Zero) { continue; }
 
-            IntPtr dup;
-            if (!DuplicateHandle(owner, handleValue, self, out dup, 0, false, DUPLICATE_SAME_ACCESS)) { continue; }
+            IntPtr handleValue = Marshal.ReadIntPtr(pEntry, ptr * 2);
+            IntPtr dup = IntPtr.Zero;
+            if (!DuplicateHandle(owner, handleValue, self, out dup, PROCESS_QUERY_LIMITED_INFORMATION, false, 0U) || dup == IntPtr.Zero) {
+                if (!DuplicateHandle(owner, handleValue, self, out dup, 0U, false, DUPLICATE_SAME_ACCESS) || dup == IntPtr.Zero) {
+                    continue;
+                }
+            }
             try {
                 int objPid = GetProcessId(dup);
                 if (objPid != 0 && targets.Contains(objPid)) {
-                    readers.Add(ownerPid);
-                    done.Add(ownerPid);
+                    uint prev;
+                    if (readerAccess.TryGetValue(ownerPid, out prev)) {
+                        readerAccess[ownerPid] = prev | access;
+                    } else {
+                        readerAccess[ownerPid] = access;
+                    }
                 }
             } catch { } finally {
                 CloseHandle(dup);
@@ -4674,12 +5020,30 @@ public static int[] FindRobloxMemoryReaders(int[] targetPids) {
         foreach (KeyValuePair<int, IntPtr> kv in opened) {
             if (kv.Value != IntPtr.Zero) { CloseHandle(kv.Value); }
         }
+        foreach (KeyValuePair<int, uint> kv in readerAccess) {
+            results.Add(kv.Key.ToString() + "|0x" + kv.Value.ToString("X8"));
+        }
     } catch {
         return null;
     } finally {
+        if (hProbe != IntPtr.Zero) { CloseHandle(hProbe); }
         Marshal.FreeHGlobal(buffer);
     }
-    return readers.ToArray();
+    return results.ToArray();
+}
+
+public static int[] FindRobloxMemoryReaders(int[] targetPids) {
+    string[] detailed = FindRobloxMemoryReadersDetailed(targetPids);
+    if (detailed == null) return null;
+    List<int> pids = new List<int>();
+    foreach (string item in detailed) {
+        int idx = item.IndexOf('|');
+        int p;
+        if (idx > 0 && int.TryParse(item.Substring(0, idx), out p)) {
+            pids.Add(p);
+        }
+    }
+    return pids.ToArray();
 }
 '@ -ErrorAction Stop
         return $true
@@ -4853,19 +5217,21 @@ function Get-ProcessForensicDetails {
         }
 
         $isUserland = (Test-UserLandProcessPath -ExecutablePath $modPath)
+        $hasModKw = [bool](Get-MatchedCheatKeyword -Text $modPath)
 
-        if ($procNameLower -eq 'svchost' -and (-not $isUserland) -and ($isMsSigned -or ($status -eq 'Valid' -and (Test-SignedByShippedRoot -Path $modPath)))) {
+        # Any Authenticode-Valid module chained to a trusted shipped Root CA outside userland/temp with no cheat keywords is a legitimate vendor DLL
+        if ((-not $isUserland) -and (-not $hasModKw) -and $status -eq 'Valid' -and ($isMsSigned -or (Test-SignedByShippedRoot -Path $modPath))) {
             continue
         }
 
-        if ($procNameLower -in @('robloxplayerbeta', 'robloxcrashhandler', 'robloxplayerlauncher') -or $details.Name -match '(?i)roblox') {
+        if ($procNameLower -in @('robloxplayerbeta', 'robloxcrashhandler', 'robloxplayerlauncher', 'bloxstrap', 'fishstrap', 'lunarstrap') -or $details.Name -match '(?i)roblox') {
             $isRobloxDir = ($mainExeDir -and $modPath.StartsWith($mainExeDir, [System.StringComparison]::OrdinalIgnoreCase))
-            if ($isRobloxSigned -or $isRobloxDir -or ($modPath -match '(?i)\\(Roblox|Bloxstrap|Fishstrap)\\Versions\\')) {
+            if ((-not $hasModKw) -and ($isRobloxSigned -or $isRobloxDir -or ($modPath -match '(?i)\\(Roblox|Bloxstrap|Fishstrap)\\Versions\\'))) {
                 continue
             }
         }
 
-        if ($status -ne 'Valid' -or $isUserland -or (-not $isMsSigned)) {
+        if ($status -ne 'Valid' -or $isUserland -or $hasModKw) {
             $details.ForeignModules += @{
                 Name   = $modLeaf
                 Path   = $modPath
@@ -5065,19 +5431,23 @@ function Get-ExternalCheatHits {
     $targets = @(Get-RobloxTargetIds)
     if ($targets.Count -gt 0) {
         $rawReaders = $null
-        try { $rawReaders = [Spetzware.ExternalScan]::FindRobloxMemoryReaders([int[]]$targets) } catch {}
+        try { $rawReaders = [Spetzware.ExternalScan]::FindRobloxMemoryReadersDetailed([int[]]$targets) } catch {}
         if ($null -eq $rawReaders) {
             $messages += 'WARNING: Memory-reader scan failed to run (results may be incomplete)'
         } else {
-            $knownBenignServices = @(
-                'sysmain', 'audiosrv', 'audioendpointbuilder', 'diagtrack', 'wsearch', 'wersvc',
-                'dcomlaunch', 'rpcss', 'cryptsvc', 'winmgmt', 'themes', 'schedule', 'appinfo',
-                'shellhwdetection', 'bits', 'iphlpsvc', 'lanmanserver', 'seclogon', 'usermgr', 'usermanager',
-                'usosvc', 'wpnservice', 'gpsvc', 'profsvc', 'eventlog', 'plugplay', 'samss',
-                'nsi', 'netman', 'dnscache', 'dhcp', 'wuauserv', 'bfe', 'mpssvc', 'wlidsvc',
-                'dusmsvc', 'dps', 'wscsvc', 'coremessagingregistrar', 'sens', 'pcasvc'
-            )
-            foreach ($ownerId in (@($rawReaders) | Select-Object -Unique)) {
+            foreach ($readerEntry in (@($rawReaders) | Select-Object -Unique)) {
+                $rParts = ([string]$readerEntry) -split '\|', 2
+                $ownerId = 0
+                if (-not [int]::TryParse($rParts[0], [ref]$ownerId) -or $ownerId -le 4 -or $ownerId -eq $PID) { continue }
+                $accessHex = if ($rParts.Count -ge 2) { $rParts[1] } else { '0x00000010' }
+                [uint32]$accVal = 0
+                try { $accVal = [Convert]::ToUInt32(($accessHex -replace '^0x', ''), 16) } catch {}
+                $accRights = @()
+                if (($accVal -band 0x0010) -ne 0) { $accRights += 'PROCESS_VM_READ' }
+                if (($accVal -band 0x0020) -ne 0) { $accRights += 'PROCESS_VM_WRITE' }
+                if (($accVal -band 0x0008) -ne 0) { $accRights += 'PROCESS_VM_OPERATION' }
+                $accessDesc = "$accessHex [$($accRights -join ', ')]"
+
                 $diag = Get-ProcessForensicDetails -TargetPid $ownerId
                 $nameLower = ($diag.Name -replace '\.exe$', '').ToLower()
 
@@ -5085,30 +5455,29 @@ function Get-ExternalCheatHits {
                 if ($nameLower -in @('robloxplayerbeta', 'robloxcrashhandler', 'robloxplayerlauncher', 'robloxstudio', 'robloxstudiobeta')) {
                     $isSignedByRoblox = ($diag.SignatureStatus -eq 'Valid' -and ($diag.Signer -match 'Roblox Corporation'))
                     $isInRobloxFolder = ($diag.Path -match '(?i)\\(Roblox|Bloxstrap|Fishstrap)\\Versions\\')
-                    # Remove self-binary from ForeignModules if reported by module enumerator
                     $realForeign = @($diag.ForeignModules | Where-Object { $_.Path -notmatch '(?i)\.exe$' -and $_.Name -notmatch '(?i)\.exe$' })
                     if (($isSignedByRoblox -or $isInRobloxFolder) -and $diag.UnsignedModules.Count -eq 0 -and $realForeign.Count -eq 0 -and $diag.UnlinkedModules.Count -eq 0) {
                         continue
                     }
                 }
 
-                # Core allowlist (roblox itself, procexp, etc.): allow only if no foreign/unsigned/unlinked modules or manual-mapped PE
+                # Core allowlist (roblox itself, bloxstrap, fishstrap, procexp, defender, system): allow if no unsigned/injected/unlinked modules or manual-mapped PE
                 if ($script:ExternalReaderAllowlist -contains $nameLower) {
                     if ($diag.UnsignedModules.Count -eq 0 -and $diag.ForeignModules.Count -eq 0 -and $diag.UnlinkedModules.Count -eq 0 -and $diag.PrivateExecRegions.Count -eq 0) {
                         continue
                     }
                 }
 
-                # Hardware / OEM gaming software (HP OMEN, Razer Synapse, Corsair iCUE, Logitech G HUB, ASUS Armoury Crate, Dell/Alienware)
-                $knownOemSigners = 'HP Inc\.|Razer|Corsair|Logitech|ASUSTeK|Dell|Alienware|SteelSeries|NVIDIA Corporation|Advanced Micro Devices'
-                if ($diag.SignatureStatus -eq 'Valid' -and ($diag.Signer -match $knownOemSigners) -and $diag.ForeignModules.Count -eq 0 -and $diag.UnlinkedModules.Count -eq 0 -and $diag.PrivateExecRegions.Count -eq 0) {
+                # Hardware / OEM gaming & overlay software (Authenticode-Valid with 0 injected/unsigned/unlinked modules)
+                $knownOemSigners = 'HP Inc\.|Razer|Corsair|Logitech|ASUSTeK|Dell|Alienware|SteelSeries|NVIDIA Corporation|Advanced Micro Devices|Discord Inc\.|Valve Corp|OBS Project|Hugh Bailey|Overwolf|Medal|Microsoft'
+                if ($diag.SignatureStatus -eq 'Valid' -and ($diag.Signer -match $knownOemSigners) -and ($script:UntrustedHandleHolderNames -notcontains $nameLower) -and $diag.ForeignModules.Count -eq 0 -and $diag.UnlinkedModules.Count -eq 0 -and $diag.PrivateExecRegions.Count -eq 0) {
                     continue
                 }
 
                 # Service host (svchost.exe) deep inspection (PEB + Kernel VAD + Private Executable Memory)
                 if ($nameLower -eq 'svchost') {
                     if ($diag.ForeignModules.Count -gt 0 -or $diag.UnlinkedModules.Count -gt 0 -or $diag.PrivateExecRegions.Count -gt 0) {
-                        $entry = "FAILURE: Injected code / foreign module inside svchost.exe reading Roblox memory (PID $ownerId) -> $($diag.Path)"
+                        $entry = "FAILURE: Injected code / foreign module inside svchost.exe reading Roblox memory (PID $ownerId, Handle Access: $accessDesc) -> $($diag.Path)"
                         $entry += "`n  |-> Root Cause: Unauthorized code or hidden module detected inside Windows Service Host via NtQueryVirtualMemory"
                         $entry += "`n  |-> Why this was FLAGGED:"
                         if ($diag.ForeignModules.Count -gt 0) {
@@ -5132,29 +5501,27 @@ function Get-ExternalCheatHits {
                     # Rogue svchost check: parent must be services.exe, path must be System32
                     $parentNorm = if ($diag.ParentName) { ($diag.ParentName.ToLower() -replace '\.exe$', '') } else { '' }
                     if ($parentNorm -and $parentNorm -ne 'services') {
-                        $entry = "FAILURE: Rogue svchost.exe reading Roblox memory (PID $ownerId, Parent: $($diag.ParentName))"
+                        $entry = "FAILURE: Rogue svchost.exe reading Roblox memory (PID $ownerId, Parent: $($diag.ParentName), Handle Access: $accessDesc)"
                         $entry += "`n  |-> Root Cause: svchost.exe was spawned by non-services process '$($diag.ParentName)' (PID $($diag.ParentPid))"
                         if ($diag.CommandLine) { $entry += "`n  |-> Command Line: $($diag.CommandLine)" }
                         $entry += "`n  |-> Conclusion: Masquerading or hollowed svchost.exe process used to proxy memory reading."
                         $messages += $entry
                         continue
                     }
-                    if ($diag.Path -and $diag.Path -notmatch '(?i)^[a-z]:\\windows\\system32\\svchost\.exe$') {
+                    if ($diag.Path -and $diag.Path -notmatch '(?i)^[a-z]:\\windows\\(system32|syswow64)\\svchost\.exe$') {
                         $entry = "FAILURE: Fake svchost.exe reading Roblox memory from abnormal path: $($diag.Path)"
                         $messages += $entry
                         continue
                     }
 
                     # Genuine Microsoft svchost with 0 foreign/unlinked modules, 0 private exec regions, and standard parent
-                    if ($diag.SignatureStatus -eq 'Valid' -and $diag.UnsignedModules.Count -eq 0 -and $diag.ForeignModules.Count -eq 0 -and $diag.UnlinkedModules.Count -eq 0 -and $diag.PrivateExecRegions.Count -eq 0) {
-                        continue
-                    }
+                    continue
                 }
 
                 # COM Surrogate / Script Host proxy inspection (dllhost, rundll32, regsvr32)
                 if ($nameLower -in @('dllhost', 'rundll32', 'regsvr32')) {
-                    $entry = "FAILURE: COM Surrogate / Host ($($diag.Name)) reading Roblox memory (PID $ownerId) -> $($diag.Path)"
-                    $entry += "`n  |-> Root Cause: COM Surrogate or script host opened handle to RobloxPlayerBeta.exe"
+                    $entry = "FAILURE: COM Surrogate / Host ($($diag.Name)) holding VM handle to Roblox memory (PID $ownerId, Access: $accessDesc) -> $($diag.Path)"
+                    $entry += "`n  |-> Root Cause: COM Surrogate or script host opened handle ($accessDesc) to RobloxPlayerBeta.exe"
                     if ($diag.ParentName) { $entry += "`n  |-> Parent Process: $($diag.ParentName) (PID $($diag.ParentPid))" }
                     if ($diag.CommandLine) { $entry += "`n  |-> Command Line: $($diag.CommandLine)" }
                     if ($diag.ForeignModules.Count -gt 0) {
@@ -5180,8 +5547,8 @@ function Get-ExternalCheatHits {
                 # External reader detected with full forensic breakdown
                 $label = "$($diag.Name) (PID $ownerId)"
                 if ($diag.Path) { $label += " -> $($diag.Path)" }
-                $entry = "FAILURE: Unauthorized process reading Roblox memory: $label"
-                $entry += "`n  |-> Root Cause: Opened PROCESS_VM_READ/WRITE handle directly to RobloxPlayerBeta.exe"
+                $entry = "FAILURE: Unauthorized external process holding kernel VM handle to Roblox: $label"
+                $entry += "`n  |-> Kernel Handle Access: $accessDesc (via NtQuerySystemInformation Handle Table)"
                 $entry += "`n  |-> Why this was FLAGGED:"
                 if ($diag.Services.Count -gt 0) {
                     $entry += "`n      [!] Hosted Services: $($diag.Services -join ', ')"
@@ -5285,6 +5652,8 @@ function Get-BootTime {
 
 function Get-BamEntries {
     $entries = @()
+    $volMap = Get-MountedVolumeMap
+    $histVolMap = Get-HistoricalVolumeMap
     $roots = @(
         'SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
         'SYSTEM\CurrentControlSet\Services\dam\State\UserSettings'
@@ -5304,17 +5673,38 @@ function Get-BamEntries {
                     $ranAt = $null
                     try { $ranAt = [DateTime]::FromFileTime([BitConverter]::ToInt64($raw, 0)) } catch {}
                     $resolved = $null
-                    if ($valueName -match '^\\Device\\HarddiskVolume\d+\\(.+)$') {
-                        $resolved = Join-Path $env:SystemDrive $matches[1]
+                    $unmountedVol = $false
+                    $removableVol = $false
+                    $diskDesc = ''
+                    if ($valueName -match '^(\\Device\\HarddiskVolume\d+)\\(.+)$') {
+                        $vKey = $matches[1].ToLowerInvariant()
+                        $vRel = $matches[2]
+                        if ($volMap.Count -gt 0) {
+                            if ($volMap.ContainsKey($vKey)) {
+                                $resolved = Join-Path $volMap[$vKey].Root $vRel
+                                if ($volMap[$vKey].VolumeLabel) { $diskDesc = " [Disk: '$($volMap[$vKey].VolumeLabel)']" }
+                                if ($volMap[$vKey].DriveType -eq 'Removable') { $removableVol = $true }
+                            } else {
+                                $unmountedVol = $true
+                                if ($histVolMap.ContainsKey($vKey)) {
+                                    $diskDesc = " [$($histVolMap[$vKey])]"
+                                }
+                            }
+                        } else {
+                            $resolved = Join-Path $env:SystemDrive $vRel
+                        }
                     } elseif ($valueName -match '^[A-Za-z]:\\') {
                         $resolved = $valueName
                     }
                     $entries += [pscustomobject]@{
-                        Raw      = $valueName
-                        Path     = $resolved
-                        Leaf     = (Split-Path -Leaf $valueName)
-                        Time     = $ranAt
-                        Sid      = $sidName
+                        Raw             = $valueName
+                        Path            = $resolved
+                        Leaf            = (Split-Path -Leaf $valueName)
+                        Time            = $ranAt
+                        Sid             = $sidName
+                        UnmountedVolume = $unmountedVol
+                        RemovableDrive  = $removableVol
+                        DiskDesc        = $diskDesc
                     }
                 }
                 $sidKey.Close()
@@ -6039,6 +6429,7 @@ function Get-UsbHistoryAlerts {
         try {
             $root = Open-LocalMachineRegistryKey -SubKeyPath $enumRoot
             if (-not $root) { continue }
+            $isStorage = ($enumRoot -like '*\USBSTOR')
             foreach ($dev in $root.GetSubKeyNames()) {
                 if ($enumRoot -like '*\USB' -and $dev -match '(?i)ROOT_HUB|VID_8087|VID_045E&PID_0[0-9A-F]{3}$') { continue }
                 $devKey = $root.OpenSubKey($dev)
@@ -6054,7 +6445,7 @@ function Get-UsbHistoryAlerts {
                             $name = [string]$instKey.GetValue('FriendlyName')
                             if (-not $name) { $name = ([string]$instKey.GetValue('DeviceDesc')) -replace '^@.*;', '' }
                             if (-not $name) { $name = $dev }
-                            $removed += [pscustomobject]@{ Name = $name; Time = $removedAt; Id = $dev }
+                            $removed += [pscustomobject]@{ Name = $name; Time = $removedAt; Id = $dev; IsStorage = $isStorage }
                         }
                     }
                     $instKey.Close()
@@ -6064,12 +6455,53 @@ function Get-UsbHistoryAlerts {
             $root.Close()
         } catch {}
     }
-    if ($removed.Count -eq 0) { return @('SUCCESS: No USB devices removed since logon') }
+
+    try {
+        foreach ($b in @(Get-BamEntries | Where-Object { $_.Time -and $_.Time -ge $logon })) {
+            if ($b.UnmountedVolume) {
+                $alerts += "FAILURE: Program '$($b.Leaf)' executed from UNPLUGGED USB / unmounted volume$($b.DiskDesc) since logon ($(Get-Date $b.Time -Format 'HH:mm:ss')) -> $($b.Raw)"
+            } elseif ($b.RemovableDrive) {
+                $alerts += "FAILURE: Program '$($b.Leaf)' executed from removable USB drive$($b.DiskDesc) since logon ($(Get-Date $b.Time -Format 'HH:mm:ss')) -> $($b.Path)"
+            }
+        }
+    } catch {}
+
+    try {
+        foreach ($lnkAlert in @(Get-UsbLnkVolumeHits)) {
+            $alerts += $lnkAlert
+        }
+    } catch {}
+
+    try {
+        if ('Spetzware.FastEntropy' -as [type]) {
+            foreach ($uHit in @([Spetzware.FastEntropy]::GetUsnBinaryAlerts())) {
+                $parts = $uHit -split '\|', 5
+                if ($parts.Count -ge 5) {
+                    $uType = $parts[0]
+                    $uAct  = $parts[1]
+                    $uDisk = $parts[2]
+                    $uPath = $parts[3]
+                    $uTime = try { (New-Object DateTime([int64]$parts[4])).ToString('HH:mm:ss') } catch { 'session' }
+                    if ($uType -eq 'PREFETCH_DEL') {
+                        $alerts += "FAILURE: USN Journal (JournalTrace) caught $uAct Prefetch trace ($uTime) on Disk [$uDisk] -> $uPath"
+                    } else {
+                        $alerts += "WARNING: USN Journal (JournalTrace) caught $uAct binary ($uTime) on Disk [$uDisk] -> $uPath"
+                    }
+                }
+            }
+        }
+    } catch {}
+
     foreach ($r in ($removed | Sort-Object Time -Descending | Select-Object -First 15)) {
-        $alerts += "INFO: USB device removed $(Get-Date $r.Time -Format 'HH:mm:ss') -> $($r.Name)"
+        if ($r.IsStorage) {
+            $alerts += "WARNING: USB storage drive unplugged since logon ($(Get-Date $r.Time -Format 'HH:mm:ss')) -> $($r.Name)"
+        } else {
+            $alerts += "INFO: USB device removed $(Get-Date $r.Time -Format 'HH:mm:ss') -> $($r.Name)"
+        }
     }
     if ($removed.Count -gt 15) { $alerts += "INFO: ... and $($removed.Count - 15) more" }
-    return $alerts
+    if ($alerts.Count -eq 0) { return @('SUCCESS: No USB devices removed or USB programs executed since logon') }
+    return @($alerts | Select-Object -Unique)
 }
 
 function Get-CpuGpuAlerts {
@@ -6799,6 +7231,8 @@ function Get-MonitorIntegrityAlerts {
 # --- Preload Step 1 Results to prevent re-flagging during live monitor ---
 $step1Categories = @{
     'PowerShell Host Integrity'    = 'pshost'
+    'Native Syscall Hooks'         = 'pshost'
+    'OBS & App Tamper'             = 'obstamper'
     'Transparent Overlays'         = 'overlay'
     'External / Overlay'           = 'external'
     'Taskmgr & Suspicious modules' = 'taskmgr'
@@ -6813,6 +7247,24 @@ foreach ($r in $script:SystemCheckResults) {
         Register-MonitorBaseline -Category $step1Categories[$r.Name] -Lines $r.Lines
     }
 }
+
+$baselineRecorders = @{}
+foreach ($recName in @('obs64', 'obs32', 'Medal', 'Streamlabs OBS', 'bdcam', 'Action')) {
+    $rp = @(Get-Process -Name $recName -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($rp.Count -gt 0) { $baselineRecorders[$recName] = $rp[0].Id }
+}
+$baselineObsStops = 0
+$baselineObsLogPath = $null
+try {
+    if ($baselineRecorders.ContainsKey('obs64') -or $baselineRecorders.ContainsKey('obs32')) {
+        $latestObs = Get-ChildItem -Path "$env:APPDATA\obs-studio\logs" -Filter '*.txt' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latestObs) {
+            $baselineObsLogPath = $latestObs.FullName
+            $baselineObsStops = @([regex]::Matches((Get-Content -LiteralPath $baselineObsLogPath -Raw -ErrorAction SilentlyContinue), '==== Recording (Stop|Pause)')).Count
+        }
+    }
+} catch {}
 
 try {
 while ($true) {
@@ -6946,8 +7398,35 @@ while ($true) {
         }
 
         foreach ($line in (Get-TransparentOverlayAlerts)) {
-            if ($line -like 'SUCCESS*') { continue }
-            Write-MonitorAlertOnce -Category 'overlay' -Message $line -LogFile $logFile -Level WARN
+            if ($line -like 'SUCCESS*' -or $line -like 'INFO*') { continue }
+            $ovLvl = if ($line -like 'FAILURE*') { 'FAIL' } else { 'WARN' }
+            Write-MonitorAlertOnce -Category 'overlay' -Message $line -LogFile $logFile -Level $ovLvl
+        }
+
+        foreach ($line in (Get-StreamingProcessIntegrityAlerts)) {
+            if ($line -like 'SUCCESS*' -or $line -like 'INFO*') { continue }
+            $stLvl = if ($line -like 'FAILURE*') { 'FAIL' } else { 'WARN' }
+            Write-MonitorAlertOnce -Category 'obstamper' -Message $line -LogFile $logFile -Level $stLvl
+        }
+
+        # Check if active recording software was stopped, paused, or closed mid-match
+        foreach ($recKey in @($baselineRecorders.Keys)) {
+            $oldRecPid = $baselineRecorders[$recKey]
+            $curRec = @(Get-Process -Name $recKey -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($curRec.Count -eq 0) {
+                Write-MonitorAlertOnce -Category 'obstamper' -Message "FAILURE: Recording software ($recKey PID $oldRecPid) was CLOSED during the match!" -LogFile $logFile -Level FAIL
+            } elseif ($curRec[0].Id -ne $oldRecPid) {
+                Write-MonitorAlertOnce -Category 'obstamper' -Message "FAILURE: Recording software ($recKey) was RESTARTED during the match (PID $oldRecPid -> $($curRec[0].Id))!" -LogFile $logFile -Level FAIL
+            }
+        }
+        if ($baselineObsLogPath -and (Test-Path -LiteralPath $baselineObsLogPath)) {
+            try {
+                $curStops = @([regex]::Matches((Get-Content -LiteralPath $baselineObsLogPath -Raw -ErrorAction SilentlyContinue), '==== Recording (Stop|Pause)')).Count
+                if ($curStops -gt $baselineObsStops) {
+                    $baselineObsStops = $curStops
+                    Write-MonitorAlert -Message "FAILURE: OBS Studio recording was STOPPED or PAUSED during the match!" -LogFile $logFile -Level FAIL
+                }
+            } catch {}
         }
 
         foreach ($line in (Get-TaskManagerIntegrityAlerts)) {
